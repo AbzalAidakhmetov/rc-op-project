@@ -1,13 +1,22 @@
-torch>=2.2
-torchaudio>=2.2
-transformers>=4.41
-sentencepiece
-resampy
-resemblyzer
-tqdm
-soundfile
-datasets
-librosa
-numpy
-phonemizer
-protobuf 
+# Core deep-learning stack
+torch>=2.2,<2.3
+torchaudio>=2.2,<2.3
+
+# Model and tokenization
+transformers>=4.41,<4.45
+sentencepiece>=0.2.0
+
+# Audio DSP / utilities
+librosa>=0.10.0
+soundfile>=0.12.1
+resampy>=0.4.3
+resemblyzer==0.1.4
+phonemizer>=3.2.1           # requires espeak-ng (installed in setup.sh)
+
+# Data handling & progress bars
+datasets>=2.19
+numpy>=1.23
+tqdm>=4.66
+
+# 🔗 Add your specific vocoder implementation below if/when it lands on PyPI
+# hifigan-vocoder==0.x.x

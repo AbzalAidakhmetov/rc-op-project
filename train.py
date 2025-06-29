@@ -145,7 +145,7 @@ def train_epoch(model, dataloader, optimizer, criterion_ce, device, epoch, total
     
     return avg_loss
 
-def save_checkpoint(model, optimizer, epoch, loss, save_path):
+def save_checkpoint(model, optimizer, epoch, loss, save_path, num_speakers=None, num_phones=None):
     """Save model checkpoint."""
     checkpoint = {
         'epoch': epoch,
@@ -153,6 +153,13 @@ def save_checkpoint(model, optimizer, epoch, loss, save_path):
         'optimizer_state_dict': optimizer.state_dict(),
         'loss': loss,
     }
+    
+    # Add metadata for proper model loading
+    if num_speakers is not None:
+        checkpoint['num_speakers'] = num_speakers
+    if num_phones is not None:
+        checkpoint['num_phones'] = num_phones
+        
     torch.save(checkpoint, save_path)
 
 def main():
@@ -245,7 +252,7 @@ def main():
         
         # Save checkpoint
         checkpoint_path = os.path.join(args.save_dir, f"rcop_epoch{epoch+1}.pt")
-        save_checkpoint(rcop_model, optimizer, epoch, avg_loss, checkpoint_path)
+        save_checkpoint(rcop_model, optimizer, epoch, avg_loss, checkpoint_path, num_speakers, num_phones)
         logger.info(f"Saved checkpoint: {checkpoint_path}")
     
     logger.info("Training completed!")
