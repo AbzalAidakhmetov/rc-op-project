@@ -179,6 +179,10 @@ dmypy.json
 *.arw
 
 # Large data directories
+data/txt
+data/wav48_silence_trimmed/
+data/speaker-info.txt
+data/update.txt
 data/raw/
 data/processed/
 data/external/

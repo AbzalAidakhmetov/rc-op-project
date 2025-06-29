@@ -15,7 +15,7 @@ phonemizer>=3.2.1           # requires espeak-ng (installed in setup.sh)
 
 # Data handling & progress bars
 datasets>=2.19
-numpy>=1.23
+numpy>=1.23,<2
 tqdm>=4.66
 
 # 🔗 Add your specific vocoder implementation below if/when it lands on PyPI

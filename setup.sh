@@ -55,6 +55,29 @@ export PATH="$CONDA_ROOT/bin:$PATH"
 # shellcheck source=/dev/null
 source "$CONDA_ROOT/etc/profile.d/conda.sh"
 
+# ── Ensure future shells can use Conda automatically ─────────────────────────
+# Some CI / remote environments do not run `conda init` by default. After we
+# have sourced Conda once (so the `conda` command is now available) we make
+# sure that interactive shells will also be able to find it next time.
+if ! grep -q "${CONDA_ROOT}/etc/profile.d/conda.sh" "$HOME/.bashrc" 2>/dev/null; then
+    info "Configuring shell integration for Conda (one-time step)…"
+    if conda init bash >/dev/null 2>&1; then
+        success "Shell integration added via 'conda init bash'"
+    else
+        # Fallback – append minimal snippet
+        warn "'conda init' failed – appending minimal activation snippet to ~/.bashrc"
+        cat <<BASHRC >> "$HOME/.bashrc"
+
+# >>> rc-op conda setup >>>
+export PATH="${CONDA_ROOT}/bin:\$PATH"
+source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+# <<< rc-op conda setup <<<
+
+BASHRC
+        success "Appended Conda initialization to ~/.bashrc"
+    fi
+fi
+
 ###############################################################################
 # 2. Environment creation / activation
 ###############################################################################
@@ -108,8 +131,20 @@ fi
 
 if [[ ! -d VCTK-Corpus-0.92 ]]; then
     info "Extracting VCTK corpus…"
-    unzip -q "$ZIP_NAME"
-    success "Extraction complete"
+    if unzip -q "$ZIP_NAME"; then
+        success "Extraction complete"
+    else
+        warn "Extraction failed – archive may be corrupted. Re-downloading…"
+        rm -f "$ZIP_NAME"
+        if command -v aria2c &>/dev/null; then
+            aria2c -x 16 -s 16 -o "$ZIP_NAME" "$VCTK_URL"
+        else
+            wget -c "$VCTK_URL" -O "$ZIP_NAME"
+        fi
+        info "Re-attempting extraction…"
+        unzip -q "$ZIP_NAME"
+        success "Extraction complete"
+    fi
 else
     success "VCTK corpus already extracted"
 fi

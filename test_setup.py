@@ -34,7 +34,7 @@ def test_imports():
     
     try:
         import resemblyzer
-        print(f"✓ Resemblyzer {resemblyzer.__version__}")
+        print(f"✓ Resemblyzer")
     except ImportError as e:
         print(f"✗ Resemblyzer import failed: {e}")
         return False
@@ -53,11 +53,11 @@ def test_model_loading():
     print("\nTesting model loading...")
     
     try:
-        from transformers import WavLMModel, Wav2Vec2Processor
+        from transformers import WavLMModel, Wav2Vec2FeatureExtractor
         
-        print("Loading WavLM processor...")
-        processor = Wav2Vec2Processor.from_pretrained("microsoft/wavlm-large")
-        print("✓ WavLM processor loaded successfully")
+        print("Loading WavLM feature extractor...")
+        processor = Wav2Vec2FeatureExtractor.from_pretrained("microsoft/wavlm-large")
+        print("✓ WavLM feature extractor loaded successfully")
         
         print("Loading WavLM model...")
         model = WavLMModel.from_pretrained("microsoft/wavlm-large")
@@ -75,22 +75,22 @@ def test_data_directory():
     """Test that data directory structure is correct."""
     print("\nTesting data directory...")
     
-    data_dir = "./data/VCTK-Corpus-0.92"
-    if os.path.exists(data_dir):
-        print(f"✓ VCTK data directory exists: {data_dir}")
-        
-        # Check for wav directories
-        wav_dirs = ["wav48", "wav48_silence_trimmed"]
-        for wav_dir in wav_dirs:
-            full_path = os.path.join(data_dir, wav_dir)
-            if os.path.exists(full_path):
-                print(f"✓ Found wav directory: {wav_dir}")
-                return True
-        
-        print("⚠ VCTK directory exists but no wav subdirectories found")
-        return False
+    # Path from default setup.sh
+    default_path = "./data/VCTK-Corpus-0.92"
+    # Path if user just unzips in ./data
+    alt_path = "./data"
+
+    data_dir = None
+    if os.path.exists(os.path.join(default_path, "wav48_silence_trimmed")):
+        data_dir = default_path
+    elif os.path.exists(os.path.join(alt_path, "wav48_silence_trimmed")):
+        data_dir = alt_path
+
+    if data_dir:
+        print(f"✓ VCTK data directory found: {data_dir}")
+        return True
     else:
-        print(f"⚠ VCTK data directory not found: {data_dir}")
+        print(f"⚠ VCTK wav data not found in {default_path} or {alt_path}")
         print("This is normal if you haven't downloaded the VCTK dataset yet.")
         return False
 

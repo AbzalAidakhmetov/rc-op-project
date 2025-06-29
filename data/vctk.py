@@ -16,22 +16,23 @@ class VCTKDataset(Dataset):
         self.data_root = Path(data_root)
         self.target_sr = target_sr
         
+        # Find the directory containing speaker folders (e.g., 'p225', 'p226')
+        wav_parent_dir = self.data_root
+        if (self.data_root / "wav48_silence_trimmed").exists():
+             wav_parent_dir = self.data_root / "wav48_silence_trimmed"
+        elif (self.data_root / "wav48").exists():
+             wav_parent_dir = self.data_root / "wav48"
+        
         # Find all wav files
         wav_files = []
-        wav_dir = self.data_root / "wav48_silence_trimmed"
-        if not wav_dir.exists():
-            wav_dir = self.data_root / "wav48"
-        if not wav_dir.exists():
-            raise ValueError(f"Could not find wav directory in {data_root}")
-            
-        for speaker_dir in wav_dir.iterdir():
+        for speaker_dir in wav_parent_dir.iterdir():
             if speaker_dir.is_dir():
                 speaker_id = speaker_dir.name
-                for wav_file in speaker_dir.glob("*.wav"):
+                for wav_file in speaker_dir.glob("*_mic1.flac"):
                     wav_files.append((str(wav_file), speaker_id))
         
         if not wav_files:
-            raise ValueError(f"No wav files found in {data_root}")
+            raise ValueError(f"No wav files found in subdirectories of {wav_parent_dir}")
             
         # Optional subset for faster training
         if subset and subset < len(wav_files):

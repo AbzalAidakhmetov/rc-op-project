@@ -5,7 +5,7 @@ import os
 import torch
 import soundfile as sf
 import numpy as np
-from transformers import WavLMModel, Wav2Vec2Processor, SpeechT5HifiGan
+from transformers import WavLMModel, Wav2Vec2FeatureExtractor, SpeechT5HifiGan
 from resemblyzer import VoiceEncoder
 
 from config import Config
@@ -156,7 +156,7 @@ def inference(checkpoint_path, source_wav, ref_wav, output_wav, device, logger, 
     logger.info("Loading models...")
     config = Config()
     
-    wavlm_processor = Wav2Vec2Processor.from_pretrained("microsoft/wavlm-large")
+    wavlm_processor = Wav2Vec2FeatureExtractor.from_pretrained("microsoft/wavlm-large")
     wavlm_model = WavLMModel.from_pretrained("microsoft/wavlm-large")
     wavlm_model.eval()
     wavlm_model.to(device)

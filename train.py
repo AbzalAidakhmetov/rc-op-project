@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import WavLMModel, Wav2Vec2Processor
+from transformers import WavLMModel, Wav2Vec2FeatureExtractor
 from resemblyzer import VoiceEncoder
 
 from config import Config
@@ -31,7 +31,7 @@ def load_models(config, num_speakers, num_phones, device):
     """Load pre-trained models and initialize RCOP."""
     
     # Load WavLM-Large (frozen)
-    wavlm_processor = Wav2Vec2Processor.from_pretrained("microsoft/wavlm-large")
+    wavlm_processor = Wav2Vec2FeatureExtractor.from_pretrained("microsoft/wavlm-large")
     wavlm_model = WavLMModel.from_pretrained("microsoft/wavlm-large")
     wavlm_model.eval()
     wavlm_model.requires_grad_(False)
@@ -104,9 +104,54 @@ def train_epoch(model, dataloader, optimizer, criterion_ce, device, epoch, total
             # Forward pass
             ph_logits, sp_logits = model(ssl_features, spk_embed, lambd)
             
-            # Dummy phoneme targets (in practice, you'd get these from text)
-            # For now, use random targets for demonstration
-            ph_targets = torch.randint(0, ph_logits.size(-1), (ph_logits.size(0),)).to(device)
+            # ----------------------------------------------------------------
+            # Derive phoneme targets from the VCTK transcription that matches
+            # the current wav.  VCTK keeps per-utterance text files in
+            #   <root>/txt/<speaker>/<utt_id>.txt
+            # Example wav:  wav48_silence_trimmed/p225/p225_001_mic1.flac
+            # Corresponding txt:            txt/p225/p225_001.txt
+            # We map the wav path to its txt path, load the transcript, convert
+            # to IPA phones and finally to IDs.  The phone sequence is then
+            # stretched/repeated to the frame count T so that each SSL frame
+            # receives a target label.  If anything goes wrong we gracefully
+            # fall back to a "UNK" label so training can continue.
+            # ----------------------------------------------------------------
+            try:
+                # 1. Build expected .txt path
+                txt_path = wav_path
+                if "wav48_silence_trimmed" in txt_path:
+                    txt_path = txt_path.replace("wav48_silence_trimmed", "txt")
+                elif "wav48" in txt_path:
+                    txt_path = txt_path.replace("wav48", "txt")
+
+                base = os.path.basename(txt_path)
+                # Remove channel/tag suffixes (e.g. _mic1) and extension
+                base = base.replace("_mic1", "")
+                utt_id = os.path.splitext(base)[0]  # p225_001
+                txt_path = os.path.join(os.path.dirname(txt_path), f"{utt_id}.txt")
+
+                # 2. Read transcript
+                with open(txt_path, "r") as f_txt:
+                    transcript = f_txt.read().strip()
+
+                # 3. Text ➔ phones ➔ IDs
+                phone_seq   = text_to_phones(transcript)
+                phone_ids   = phones_to_ids(phone_seq)
+
+                if len(phone_ids) == 0:
+                    raise ValueError("Empty phone sequence")
+
+                # 4. Expand / repeat to match number of frames T
+                import math
+                T          = ph_logits.size(0)
+                repeats    = math.ceil(T / len(phone_ids))
+                expanded   = (phone_ids * repeats)[:T]
+                ph_targets = torch.tensor(expanded, dtype=torch.long, device=device)
+            except Exception as e:
+                logger.warning(f"Phoneme target generation failed for {wav_path}: {e}; using UNK label")
+                unk_id     = get_num_phones() - 1  # 'UNK' is last in list
+                ph_targets = torch.full((ph_logits.size(0),), unk_id, dtype=torch.long, device=device)
+            
             sp_targets = spk_id.to(device)
             
             # Compute losses
