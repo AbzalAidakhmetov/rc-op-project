@@ -1,13 +1,13 @@
-# RC-OP: Representation Controllable Orthogonal Projection
+# RC-OP: Reference-Conditioned Orthogonal Projection
 
 A clean, modular implementation of RC-OP for voice conversion using WavLM-Large SSL features and orthogonal projection. This implementation is designed to run on VAST.ai GPU instances without Docker or Colab dependencies.
 
 ## Overview
 
-RC-OP (Representation Controllable Orthogonal Projection) is a voice conversion method that:
+RC-OP (Reference-Conditioned Orthogonal Projection) is a voice conversion method that:
 - Uses WavLM-Large for self-supervised speech representations
 - Employs Resemblyzer for speaker embeddings  
-- Applies orthogonal projection to remove speaker information from content features
+- Applies orthogonal projection to explicitly remove speaker information from content features by projecting each frame onto the subspace orthogonal to a learned speaker axis
 - Uses gradient reversal to ensure speaker-agnostic content representations
 
 ## Project Structure
