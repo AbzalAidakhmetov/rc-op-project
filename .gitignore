@@ -183,7 +183,7 @@ data/txt
 data/wav48_silence_trimmed/
 data/speaker-info.txt
 data/update.txt
-# data/VCTK-Corpus-0.92.zip
+data/VCTK-Corpus-0.92.zip
 data/raw/
 data/processed/
 data/external/

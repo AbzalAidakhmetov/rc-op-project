@@ -23,16 +23,23 @@ class VCTKDataset(Dataset):
         elif (self.data_root / "wav48").exists():
              wav_parent_dir = self.data_root / "wav48"
         
-        # Find all wav files
+        # Find all wav files and ensure they have a matching transcript
         wav_files = []
+        txt_root = self.data_root / "txt"
+
         for speaker_dir in wav_parent_dir.iterdir():
             if speaker_dir.is_dir():
                 speaker_id = speaker_dir.name
-                for wav_file in speaker_dir.glob("*_mic1.flac"):
-                    wav_files.append((str(wav_file), speaker_id))
+                for wav_path in speaker_dir.glob("*_mic1.flac"):
+                    # Check for corresponding text file
+                    utt_id = wav_path.stem.replace("_mic1", "")
+                    txt_path = txt_root / speaker_id / f"{utt_id}.txt"
+                    
+                    if txt_path.exists():
+                        wav_files.append((str(wav_path), speaker_id))
         
         if not wav_files:
-            raise ValueError(f"No wav files found in subdirectories of {wav_parent_dir}")
+            raise ValueError(f"No valid audio-text pairs found in subdirectories of {wav_parent_dir}")
             
         # Optional subset for faster training
         if subset and subset < len(wav_files):

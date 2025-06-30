@@ -88,7 +88,7 @@ def test_data_directory():
 
     if data_dir:
         print(f"✓ VCTK data directory found: {data_dir}")
-        return True
+                return True
     else:
         print(f"⚠ VCTK wav data not found in {default_path} or {alt_path}")
         print("This is normal if you haven't downloaded the VCTK dataset yet.")

@@ -2,6 +2,7 @@
 
 import argparse
 import os
+from pathlib import Path
 import random
 import numpy as np
 import torch
@@ -17,6 +18,11 @@ from data.vctk import create_dataloader
 from models.rcop import RCOP
 from utils.logging import setup_logger, log_config, log_model_summary
 from utils.phonemes import get_num_phones, text_to_phones, phones_to_ids
+
+# Mitigate threading issues with BLAS libraries (for resource-limited environments)
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OMP_NUM_THREADS'] = '1'
 
 def set_seed(seed):
     """Set random seeds for reproducibility."""
@@ -117,18 +123,14 @@ def train_epoch(model, dataloader, optimizer, criterion_ce, device, epoch, total
             # fall back to a "UNK" label so training can continue.
             # ----------------------------------------------------------------
             try:
-                # 1. Build expected .txt path
-                txt_path = wav_path
-                if "wav48_silence_trimmed" in txt_path:
-                    txt_path = txt_path.replace("wav48_silence_trimmed", "txt")
-                elif "wav48" in txt_path:
-                    txt_path = txt_path.replace("wav48", "txt")
+                # 1. Build expected .txt path robustly
+                wav_p = Path(wav_path)
+                data_root = dataloader.dataset.data_root
 
-                base = os.path.basename(txt_path)
-                # Remove channel/tag suffixes (e.g. _mic1) and extension
-                base = base.replace("_mic1", "")
-                utt_id = os.path.splitext(base)[0]  # p225_001
-                txt_path = os.path.join(os.path.dirname(txt_path), f"{utt_id}.txt")
+                speaker_id = wav_p.parent.name
+                utt_id = wav_p.stem.replace("_mic1", "")
+                
+                txt_path = data_root / "txt" / speaker_id / f"{utt_id}.txt"
 
                 # 2. Read transcript
                 with open(txt_path, "r") as f_txt:
@@ -139,7 +141,7 @@ def train_epoch(model, dataloader, optimizer, criterion_ce, device, epoch, total
                 phone_ids   = phones_to_ids(phone_seq)
 
                 if len(phone_ids) == 0:
-                    raise ValueError("Empty phone sequence")
+                    raise ValueError("Empty phone sequence from transcript")
 
                 # 4. Expand / repeat to match number of frames T
                 import math
@@ -147,10 +149,19 @@ def train_epoch(model, dataloader, optimizer, criterion_ce, device, epoch, total
                 repeats    = math.ceil(T / len(phone_ids))
                 expanded   = (phone_ids * repeats)[:T]
                 ph_targets = torch.tensor(expanded, dtype=torch.long, device=device)
-            except Exception as e:
-                logger.warning(f"Phoneme target generation failed for {wav_path}: {e}; using UNK label")
-                unk_id     = get_num_phones() - 1  # 'UNK' is last in list
+
+            except FileNotFoundError:
+                # This is a recoverable error for a single missing transcript.
+                logger.warning(f"Transcript not found for {wav_path}; using UNK label")
+                unk_id     = get_num_phones() - 1
                 ph_targets = torch.full((ph_logits.size(0),), unk_id, dtype=torch.long, device=device)
+
+            except Exception as e:
+                # Any other exception here is likely a critical setup error (e.g., espeak missing).
+                # This is not recoverable. Log it and re-raise to stop the training run.
+                logger.error(f"A critical error occurred during phoneme generation for {wav_path}: {e}")
+                logger.error("This may indicate a problem with your environment, such as the 'espeak-ng' library not being installed or accessible. Please run setup.sh or install it manually.")
+                raise e
             
             sp_targets = spk_id.to(device)
             
