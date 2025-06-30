@@ -22,6 +22,16 @@ from models.rcop import RCOP
 from utils.logging import setup_logger
 from utils.phonemes import get_num_phones
 
+def set_seed(seed):
+    """Set random seeds for reproducibility."""
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
 def load_model_from_checkpoint(checkpoint_path, num_speakers, num_phones, device):
     """Load RCOP model from checkpoint."""
     config = Config()
@@ -150,6 +160,10 @@ def evaluate_speaker_disentanglement(model, dataloader, wavlm_processor, wavlm_m
             similarities = torch.cosine_similarity(embeds, mean_embed.unsqueeze(0))
             speaker_similarities.extend(similarities.tolist())
     
+    if not content_similarities or not speaker_similarities:
+        logger.warning("Could not compute similarity scores. This typically requires more than one sample per speaker in the evaluation set.")
+        return 0, 0
+
     avg_content_sim = np.mean(content_similarities) if content_similarities else 0
     avg_speaker_sim = np.mean(speaker_similarities) if speaker_similarities else 0
     
@@ -231,6 +245,10 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     
+    # Set seed for reproducibility
+    set_seed(Config().seed)
+    logger.info(f"Using random seed: {Config().seed}")
+
     # Evaluate model
     results = evaluate_model(args.ckpt, args.data_root, device, logger, args.subset)
     

@@ -85,7 +85,7 @@ def extract_features(audio, wavlm_processor, wavlm_model, voice_encoder, device)
     
     return ssl_features, spk_embed
 
-def train_epoch(model, dataloader, optimizer, criterion_ce, device, epoch, total_epochs, logger, phoneme_cache):
+def train_epoch(model, dataloader, optimizer, criterion_ce, device, epoch, total_epochs, logger, phoneme_cache, wavlm_processor, wavlm_model, voice_encoder):
     """Train for one epoch."""
     model.train()
     total_loss = 0
@@ -103,9 +103,9 @@ def train_epoch(model, dataloader, optimizer, criterion_ce, device, epoch, total
         try:
             # Extract features
             ssl_features, spk_embed = extract_features(
-                audio, dataloader.dataset.wavlm_processor, 
-                dataloader.dataset.wavlm_model, 
-                dataloader.dataset.voice_encoder, 
+                audio, wavlm_processor, 
+                wavlm_model, 
+                voice_encoder, 
                 device
             )
             
@@ -285,11 +285,6 @@ def main():
         config, num_speakers, num_phones, device
     )
     
-    # Store models in dataset for easy access
-    dataset.wavlm_processor = wavlm_processor  # type: ignore
-    dataset.wavlm_model = wavlm_model  # type: ignore
-    dataset.voice_encoder = voice_encoder  # type: ignore
-    
     log_model_summary(logger, rcop_model)
     
     # Setup optimizer and loss
@@ -312,7 +307,8 @@ def main():
     for epoch in range(start_epoch, config.epochs):
         avg_loss = train_epoch(
             rcop_model, dataloader, optimizer, criterion_ce, 
-            device, epoch, config.epochs, logger, phoneme_cache
+            device, epoch, config.epochs, logger, phoneme_cache,
+            wavlm_processor, wavlm_model, voice_encoder
         )
         
         # Save checkpoint

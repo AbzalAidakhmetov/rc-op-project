@@ -20,6 +20,16 @@ from models.rcop import RCOP
 from utils.logging import setup_logger
 from utils.phonemes import get_num_phones
 
+def set_seed(seed):
+    """Set random seeds for reproducibility."""
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
 def load_audio(file_path, target_sr=16000):
     """Load and preprocess audio file."""
     try:
@@ -270,6 +280,10 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     
+    # Set seed for reproducibility
+    set_seed(Config().seed)
+    logger.info(f"Using random seed: {Config().seed}")
+
     # Perform inference
     try:
         results = inference(
