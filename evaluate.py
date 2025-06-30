@@ -2,10 +2,17 @@
 
 import argparse
 import os
+
+# Mitigate threading issues with BLAS libraries (for resource-limited environments)
+# This must be done BEFORE importing torch, numpy, etc.
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OMP_NUM_THREADS'] = '1'
+
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
-from transformers import WavLMModel, Wav2Vec2Processor
+from transformers import WavLMModel, Wav2Vec2FeatureExtractor
 from resemblyzer import VoiceEncoder
 from tqdm import tqdm
 
@@ -171,7 +178,7 @@ def evaluate_model(checkpoint_path, data_root, device, logger, subset=100):
     logger.info(f"Evaluation dataset: {len(dataset)} samples, {num_speakers} speakers")
     
     # Load models
-    wavlm_processor = Wav2Vec2Processor.from_pretrained("microsoft/wavlm-large")
+    wavlm_processor = Wav2Vec2FeatureExtractor.from_pretrained("microsoft/wavlm-large")
     wavlm_model = WavLMModel.from_pretrained("microsoft/wavlm-large")
     wavlm_model.eval()
     wavlm_model.to(device)

@@ -2,6 +2,13 @@
 
 import argparse
 import os
+
+# Mitigate threading issues with BLAS libraries (for resource-limited environments)
+# This must be done BEFORE importing torch, numpy, etc.
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OMP_NUM_THREADS'] = '1'
+
 import torch
 import soundfile as sf
 import numpy as np

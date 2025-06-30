@@ -2,6 +2,13 @@
 
 import argparse
 import os
+
+# Mitigate threading issues with BLAS libraries (for resource-limited environments)
+# This must be done BEFORE importing torch, numpy, etc.
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OMP_NUM_THREADS'] = '1'
+
 from pathlib import Path
 import random
 import numpy as np
@@ -18,11 +25,6 @@ from data.vctk import create_dataloader
 from models.rcop import RCOP
 from utils.logging import setup_logger, log_config, log_model_summary
 from utils.phonemes import get_num_phones, text_to_phones, phones_to_ids
-
-# Mitigate threading issues with BLAS libraries (for resource-limited environments)
-os.environ['OPENBLAS_NUM_THREADS'] = '1'
-os.environ['MKL_NUM_THREADS'] = '1'
-os.environ['OMP_NUM_THREADS'] = '1'
 
 def set_seed(seed):
     """Set random seeds for reproducibility."""
@@ -83,7 +85,7 @@ def extract_features(audio, wavlm_processor, wavlm_model, voice_encoder, device)
     
     return ssl_features, spk_embed
 
-def train_epoch(model, dataloader, optimizer, criterion_ce, device, epoch, total_epochs, logger):
+def train_epoch(model, dataloader, optimizer, criterion_ce, device, epoch, total_epochs, logger, phoneme_cache):
     """Train for one epoch."""
     model.train()
     total_loss = 0
@@ -123,22 +125,28 @@ def train_epoch(model, dataloader, optimizer, criterion_ce, device, epoch, total
             # fall back to a "UNK" label so training can continue.
             # ----------------------------------------------------------------
             try:
-                # 1. Build expected .txt path robustly
-                wav_p = Path(wav_path)
-                data_root = dataloader.dataset.data_root
+                if wav_path in phoneme_cache:
+                    phone_ids = phoneme_cache[wav_path]
+                else:
+                    # 1. Build expected .txt path robustly
+                    wav_p = Path(wav_path)
+                    data_root = dataloader.dataset.data_root
 
-                speaker_id = wav_p.parent.name
-                utt_id = wav_p.stem.replace("_mic1", "")
-                
-                txt_path = data_root / "txt" / speaker_id / f"{utt_id}.txt"
+                    speaker_id = wav_p.parent.name
+                    utt_id = wav_p.stem.replace("_mic1", "")
+                    
+                    txt_path = data_root / "txt" / speaker_id / f"{utt_id}.txt"
 
-                # 2. Read transcript
-                with open(txt_path, "r") as f_txt:
-                    transcript = f_txt.read().strip()
+                    # 2. Read transcript
+                    with open(txt_path, "r") as f_txt:
+                        transcript = f_txt.read().strip()
 
-                # 3. Text ➔ phones ➔ IDs
-                phone_seq   = text_to_phones(transcript)
-                phone_ids   = phones_to_ids(phone_seq)
+                    # 3. Text ➔ phones ➔ IDs
+                    phone_seq   = text_to_phones(transcript)
+                    phone_ids   = phones_to_ids(phone_seq)
+                    
+                    # Cache the result
+                    phoneme_cache[wav_path] = phone_ids
 
                 if len(phone_ids) == 0:
                     raise ValueError("Empty phone sequence from transcript")
@@ -300,10 +308,11 @@ def main():
     
     # Training loop
     logger.info("Starting training...")
+    phoneme_cache = {}  # Cache for phoneme conversions
     for epoch in range(start_epoch, config.epochs):
         avg_loss = train_epoch(
             rcop_model, dataloader, optimizer, criterion_ce, 
-            device, epoch, config.epochs, logger
+            device, epoch, config.epochs, logger, phoneme_cache
         )
         
         # Save checkpoint
