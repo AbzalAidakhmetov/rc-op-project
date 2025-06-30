@@ -36,6 +36,18 @@ def load_model_from_checkpoint(checkpoint_path, num_speakers, num_phones, device
     """Load RCOP model from checkpoint."""
     config = Config()
     
+    # Load checkpoint first to get metadata
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Try to extract num_speakers from checkpoint metadata
+    if 'num_speakers' in checkpoint:
+        num_speakers = checkpoint['num_speakers']
+    elif 'model_state_dict' in checkpoint:
+        # Infer from model state dict if available
+        state_dict = checkpoint['model_state_dict']
+        if 'sp_clf.weight' in state_dict:
+            num_speakers = state_dict['sp_clf.weight'].size(0)
+    
     # Initialize model
     model = RCOP(
         d_spk=config.d_spk,
@@ -45,12 +57,11 @@ def load_model_from_checkpoint(checkpoint_path, num_speakers, num_phones, device
     )
     
     # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
     model.eval()
     
-    return model
+    return model, num_speakers
 
 def extract_features(audio, wavlm_processor, wavlm_model, voice_encoder, device):
     """Extract SSL features and speaker embeddings."""
@@ -186,10 +197,10 @@ def evaluate_model(checkpoint_path, data_root, device, logger, subset=100):
         shuffle=False
     )
     
-    num_speakers = dataset.get_num_speakers()
+    num_speakers_in_dataset = dataset.get_num_speakers()
     num_phones = get_num_phones()
     
-    logger.info(f"Evaluation dataset: {len(dataset)} samples, {num_speakers} speakers")
+    logger.info(f"Evaluation dataset: {len(dataset)} samples, {num_speakers_in_dataset} speakers")
     
     # Load models
     wavlm_processor = Wav2Vec2FeatureExtractor.from_pretrained("microsoft/wavlm-large")
@@ -200,7 +211,10 @@ def evaluate_model(checkpoint_path, data_root, device, logger, subset=100):
     voice_encoder = VoiceEncoder()
     voice_encoder.eval()
     
-    rcop_model = load_model_from_checkpoint(checkpoint_path, num_speakers, num_phones, device)
+    # The number of speakers is determined by the CHECKPOINT.
+    # Pass a dummy value for num_speakers; it will be overwritten by the checkpoint metadata.
+    rcop_model, num_speakers_from_ckpt = load_model_from_checkpoint(checkpoint_path, 1, num_phones, device)
+    logger.info(f"Loaded model trained on {num_speakers_from_ckpt} speakers.")
     
     # Evaluate speaker classification
     speaker_acc = evaluate_speaker_classification(
