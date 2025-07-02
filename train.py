@@ -2,16 +2,14 @@
 
 import argparse
 import os
-
-# Mitigate threading issues with BLAS libraries (for resource-limited environments)
-# This must be done BEFORE importing torch, numpy, etc.
-os.environ['OPENBLAS_NUM_THREADS'] = '1'
-os.environ['MKL_NUM_THREADS'] = '1'
-os.environ['OMP_NUM_THREADS'] = '1'
-
 from pathlib import Path
-import random
-import numpy as np
+
+# --- Environment Setup ---
+# This must be done BEFORE importing torch, numpy, etc. to mitigate threading issues.
+from utils.environment import setup_environment
+setup_environment()
+# -------------------------
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -19,24 +17,19 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import WavLMModel, Wav2Vec2FeatureExtractor
 from resemblyzer import VoiceEncoder
+import torchaudio.transforms as T
 
 from config import Config
 from data.vctk import create_dataloader
 from models.rcop import RCOP
 from utils.logging import setup_logger, log_config, log_model_summary
 from utils.phonemes import get_num_phones, text_to_phones, phones_to_ids
+from utils.environment import set_seed
+from utils.features import extract_features
+from utils.checkpoint import save_checkpoint
 
-def set_seed(seed):
-    """Set random seeds for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
-def load_models(config, num_speakers, num_phones, device):
-    """Load pre-trained models and initialize RCOP."""
+def load_pretrained_models(device):
+    """Load pre-trained models that do not depend on data stats."""
     
     # Load WavLM-Large (frozen)
     wavlm_processor = Wav2Vec2FeatureExtractor.from_pretrained("microsoft/wavlm-large")
@@ -49,55 +42,22 @@ def load_models(config, num_speakers, num_phones, device):
     voice_encoder = VoiceEncoder()
     voice_encoder.eval()
     
-    # Initialize RCOP model
-    rcop_model = RCOP(
-        d_spk=config.d_spk,
-        d_ssl=config.d_ssl,
-        n_phones=num_phones,
-        n_spk=num_speakers
-    )
-    rcop_model.to(device)
-    
-    return wavlm_processor, wavlm_model, voice_encoder, rcop_model
+    return wavlm_processor, wavlm_model, voice_encoder
 
-def extract_features(audio, wavlm_processor, wavlm_model, voice_encoder, device):
-    """Extract SSL features and speaker embeddings."""
-    
-    # Ensure audio is the right shape and on CPU for processing
-    if audio.dim() == 1:
-        audio_np = audio.numpy()
-    else:
-        audio_np = audio.squeeze().numpy()
-    
-    # Extract SSL features with WavLM
-    inputs = wavlm_processor(audio_np, sampling_rate=16000, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    
-    with torch.no_grad():
-        ssl_outputs = wavlm_model(**inputs)
-        ssl_features = ssl_outputs.last_hidden_state.squeeze(0)  # (T, d_ssl)
-    
-    # Extract speaker embedding with Resemblyzer
-    with torch.no_grad():
-        # Resemblyzer expects numpy array
-        spk_embed = voice_encoder.embed_utterance(audio_np)
-        spk_embed = torch.from_numpy(spk_embed).float().to(device)  # (d_spk,)
-    
-    return ssl_features, spk_embed
-
-def train_epoch(model, dataloader, optimizer, criterion_ce, device, epoch, total_epochs, logger, phoneme_cache, wavlm_processor, wavlm_model, voice_encoder):
+def train_epoch(model, dataloader, optimizer, criterion_ce, criterion_l1, device, epoch, total_epochs, logger, wavlm_processor, wavlm_model, voice_encoder, mel_spectrogram):
     """Train for one epoch."""
     model.train()
     total_loss = 0
     total_ph_loss = 0
     total_sp_loss = 0
+    total_recon_loss = 0
     
     # Lambda schedule
     lambd = (epoch + 1) / total_epochs if total_epochs > 0 else 1.0
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
     
-    for batch_idx, (audio, spk_id, wav_path) in enumerate(pbar):
+    for batch_idx, (audio, spk_id, wav_path, phone_ids) in enumerate(pbar):
         optimizer.zero_grad()
         
         try:
@@ -110,7 +70,7 @@ def train_epoch(model, dataloader, optimizer, criterion_ce, device, epoch, total
             )
             
             # Forward pass
-            ph_logits, sp_logits = model(ssl_features, spk_embed, lambd)
+            ph_logits, sp_logits, pred_mels = model(ssl_features, spk_embed, lambd)
             
             # ----------------------------------------------------------------
             # Derive phoneme targets from the VCTK transcription that matches
@@ -125,29 +85,6 @@ def train_epoch(model, dataloader, optimizer, criterion_ce, device, epoch, total
             # fall back to a "UNK" label so training can continue.
             # ----------------------------------------------------------------
             try:
-                if wav_path in phoneme_cache:
-                    phone_ids = phoneme_cache[wav_path]
-                else:
-                    # 1. Build expected .txt path robustly
-                    wav_p = Path(wav_path)
-                    data_root = dataloader.dataset.data_root
-
-                    speaker_id = wav_p.parent.name
-                    utt_id = wav_p.stem.replace("_mic1", "")
-                    
-                    txt_path = data_root / "txt" / speaker_id / f"{utt_id}.txt"
-
-                    # 2. Read transcript
-                    with open(txt_path, "r") as f_txt:
-                        transcript = f_txt.read().strip()
-
-                    # 3. Text ➔ phones ➔ IDs
-                    phone_seq   = text_to_phones(transcript)
-                    phone_ids   = phones_to_ids(phone_seq)
-                    
-                    # Cache the result
-                    phoneme_cache[wav_path] = phone_ids
-
                 if len(phone_ids) == 0:
                     raise ValueError("Empty phone sequence from transcript")
 
@@ -158,27 +95,36 @@ def train_epoch(model, dataloader, optimizer, criterion_ce, device, epoch, total
                 expanded   = (phone_ids * repeats)[:T]
                 ph_targets = torch.tensor(expanded, dtype=torch.long, device=device)
 
-            except FileNotFoundError:
-                # This is a recoverable error for a single missing transcript.
-                logger.warning(f"Transcript not found for {wav_path}; using UNK label")
-                unk_id     = get_num_phones() - 1
-                ph_targets = torch.full((ph_logits.size(0),), unk_id, dtype=torch.long, device=device)
-
             except Exception as e:
-                # Any other exception here is likely a critical setup error (e.g., espeak missing).
-                # This is not recoverable. Log it and re-raise to stop the training run.
-                logger.error(f"A critical error occurred during phoneme generation for {wav_path}: {e}")
-                logger.error("This may indicate a problem with your environment, such as the 'espeak-ng' library not being installed or accessible. Please run setup.sh or install it manually.")
-                raise e
+                logger.warning(f"Skipping batch {batch_idx} due to error: {e}")
+                continue
             
             sp_targets = spk_id.to(device)
             
+            # --- Reconstruction Target ---
+            gt_mels = mel_spectrogram(audio.to(device))
+            
+            # Match dimensions (pad or trim predicted mels)
+            T_gt = gt_mels.size(-1)
+            T_pred = pred_mels.size(0)
+            
+            # WavLM features may have slightly different T, so we align
+            if T_pred > T_gt:
+                pred_mels_aligned = pred_mels[:T_gt, :]
+            else:
+                pred_mels_aligned = torch.nn.functional.pad(pred_mels, (0, 0, 0, T_gt - T_pred))
+            
+            # The mel spectrogram transform returns (n_channels, n_mels, time)
+            # We need (time, n_mels) to match the model output
+            gt_mels_aligned = gt_mels.squeeze(0).transpose(0, 1)
+
             # Compute losses
             ph_loss = criterion_ce(ph_logits, ph_targets)
             sp_loss = criterion_ce(sp_logits, sp_targets.unsqueeze(0))
+            recon_loss = criterion_l1(pred_mels_aligned, gt_mels_aligned)
             
             # Total loss
-            total_batch_loss = ph_loss + sp_loss
+            total_batch_loss = ph_loss + sp_loss + recon_loss
             
             # Backward pass
             total_batch_loss.backward()
@@ -188,12 +134,14 @@ def train_epoch(model, dataloader, optimizer, criterion_ce, device, epoch, total
             total_loss += total_batch_loss.item()
             total_ph_loss += ph_loss.item()
             total_sp_loss += sp_loss.item()
+            total_recon_loss += recon_loss.item()
             
             # Update progress bar
             pbar.set_postfix({
                 'Loss': f'{total_batch_loss.item():.4f}',
                 'Ph': f'{ph_loss.item():.4f}',
                 'Sp': f'{sp_loss.item():.4f}',
+                'Recon': f'{recon_loss.item():.4f}',
                 'λ': f'{lambd:.3f}'
             })
             
@@ -204,27 +152,11 @@ def train_epoch(model, dataloader, optimizer, criterion_ce, device, epoch, total
     avg_loss = total_loss / len(dataloader)
     avg_ph_loss = total_ph_loss / len(dataloader)
     avg_sp_loss = total_sp_loss / len(dataloader)
+    avg_recon_loss = total_recon_loss / len(dataloader)
     
-    logger.info(f"Epoch {epoch+1}: Loss={avg_loss:.4f}, Ph={avg_ph_loss:.4f}, Sp={avg_sp_loss:.4f}, λ={lambd:.3f}")
+    logger.info(f"Epoch {epoch+1}: Loss={avg_loss:.4f}, Ph={avg_ph_loss:.4f}, Sp={avg_sp_loss:.4f}, Recon={avg_recon_loss:.4f}, λ={lambd:.3f}")
     
     return avg_loss
-
-def save_checkpoint(model, optimizer, epoch, loss, save_path, num_speakers=None, num_phones=None):
-    """Save model checkpoint."""
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'loss': loss,
-    }
-    
-    # Add metadata for proper model loading
-    if num_speakers is not None:
-        checkpoint['num_speakers'] = num_speakers
-    if num_phones is not None:
-        checkpoint['num_phones'] = num_phones
-        
-    torch.save(checkpoint, save_path)
 
 def main():
     parser = argparse.ArgumentParser(description="Train RC-OP model")
@@ -237,6 +169,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda", help="Device to use")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     parser.add_argument("--log_dir", type=str, default="logs", help="Directory for logs")
+    parser.add_argument("--max_duration", type=int, default=15, help="Maximum audio duration in seconds to filter dataset.")
     
     args = parser.parse_args()
     
@@ -264,14 +197,31 @@ def main():
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     
-    # Create dataloader
+    # --- Load models FIRST to avoid thread exhaustion ---
+    logger.info("Loading pre-trained models (WavLM, Resemblyzer)...")
+    wavlm_processor, wavlm_model, voice_encoder = load_pretrained_models(device)
+    
+    # --- Mel Spectrogram transform ---
+    mel_spectrogram = T.MelSpectrogram(
+        sample_rate=config.target_sr,
+        n_fft=1024,
+        win_length=1024,
+        hop_length=256,
+        n_mels=80,
+        f_min=0,
+        f_max=8000
+    ).to(device)
+
+    # --- Create dataloader SECOND ---
+    # This will now run the phonemizing step after heavy models are loaded
     logger.info("Loading dataset...")
     dataloader, dataset = create_dataloader(
         data_root=args.data_root,
         target_sr=config.target_sr,
         subset=config.subset,
         batch_size=config.batch_size,
-        shuffle=True
+        shuffle=True,
+        max_duration_s=args.max_duration
     )
     
     num_speakers = dataset.get_num_speakers()
@@ -279,17 +229,22 @@ def main():
     
     logger.info(f"Dataset: {len(dataset)} samples, {num_speakers} speakers, {num_phones} phonemes")
     
-    # Load models
-    logger.info("Loading models...")
-    wavlm_processor, wavlm_model, voice_encoder, rcop_model = load_models(
-        config, num_speakers, num_phones, device
+    # --- Initialize RCOP model THIRD, now that we have num_speakers ---
+    logger.info("Initializing RCOP model...")
+    rcop_model = RCOP(
+        d_spk=config.d_spk,
+        d_ssl=config.d_ssl,
+        n_phones=num_phones,
+        n_spk=num_speakers
     )
-    
+    rcop_model.to(device)
+
     log_model_summary(logger, rcop_model)
     
-    # Setup optimizer and loss
+    # Setup optimizer and losses
     optimizer = optim.Adam(rcop_model.parameters(), lr=config.lr)
     criterion_ce = nn.CrossEntropyLoss()
+    criterion_l1 = nn.L1Loss()
     
     # Resume from checkpoint if specified
     start_epoch = 0
@@ -303,12 +258,11 @@ def main():
     
     # Training loop
     logger.info("Starting training...")
-    phoneme_cache = {}  # Cache for phoneme conversions
     for epoch in range(start_epoch, config.epochs):
         avg_loss = train_epoch(
-            rcop_model, dataloader, optimizer, criterion_ce, 
-            device, epoch, config.epochs, logger, phoneme_cache,
-            wavlm_processor, wavlm_model, voice_encoder
+            rcop_model, dataloader, optimizer, criterion_ce, criterion_l1,
+            device, epoch, config.epochs, logger,
+            wavlm_processor, wavlm_model, voice_encoder, mel_spectrogram
         )
         
         # Save checkpoint

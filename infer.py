@@ -3,11 +3,11 @@
 import argparse
 import os
 
-# Mitigate threading issues with BLAS libraries (for resource-limited environments)
-# This must be done BEFORE importing torch, numpy, etc.
-os.environ['OPENBLAS_NUM_THREADS'] = '1'
-os.environ['MKL_NUM_THREADS'] = '1'
-os.environ['OMP_NUM_THREADS'] = '1'
+# --- Environment Setup ---
+# This must be done BEFORE importing torch, numpy, etc. to mitigate threading issues.
+from utils.environment import setup_environment
+setup_environment()
+# -------------------------
 
 import torch
 import soundfile as sf
@@ -19,16 +19,9 @@ from config import Config
 from models.rcop import RCOP
 from utils.logging import setup_logger
 from utils.phonemes import get_num_phones
-
-def set_seed(seed):
-    """Set random seeds for reproducibility."""
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+from utils.environment import set_seed
+from utils.features import extract_features
+from utils.checkpoint import load_model_from_checkpoint
 
 def load_audio(file_path, target_sr=16000):
     """Load and preprocess audio file."""
@@ -102,23 +95,31 @@ def extract_features(audio, wavlm_processor, wavlm_model, voice_encoder, device)
     
     return ssl_features, spk_embed
 
-def convert_voice(rcop_model, source_ssl_features, ref_spk_embed, device):
-    """Convert voice by projecting source content to reference speaker."""
-    
+def convert_voice(rcop_model, source_ssl_features, source_spk_embed, ref_spk_embed, device):
+    """Convert voice by removing source speaker and adding reference speaker."""
     with torch.no_grad():
-        # Get the speaker axis for reference speaker
+        from models.projection import orthogonal_project
+        import torch.nn.functional as F
+
+        # 1. Get the source speaker axis and remove its projection
+        source_axis = rcop_model.W_proj(source_spk_embed)
+        content_features = orthogonal_project(source_ssl_features, source_axis)
+        
+        # 2. Get the reference speaker axis
         ref_axis = rcop_model.W_proj(ref_spk_embed)
         
-        # Project source SSL features to remove speaker info
-        from models.projection import orthogonal_project
-        content_features = orthogonal_project(source_ssl_features, ref_axis)
+        # 3. Calculate the magnitude of the speaker information in the original signal
+        source_axis_norm = F.normalize(source_axis, dim=-1)
+        alpha = torch.sum(source_ssl_features * source_axis_norm.unsqueeze(0), dim=-1, keepdim=True)
         
-        # In a complete implementation, you would:
-        # 1. Use the content features to synthesize speech with the reference speaker
-        # 2. This typically involves a vocoder or TTS system
-        # For now, we return the content features
+        # 4. Add this magnitude along the reference speaker's axis
+        ref_axis_norm = F.normalize(ref_axis, dim=-1)
+        converted_features = content_features + alpha * ref_axis_norm.unsqueeze(0)
         
-        return content_features
+        # 5. Project to mel-spectrogram using the trained vocoder head
+        pred_mels = rcop_model.vocoder_head(converted_features)
+
+        return pred_mels
 
 def simple_vocoder_synthesis(features, target_length=None):
     """Simple placeholder vocoder - converts features back to audio."""
@@ -202,7 +203,9 @@ def inference(checkpoint_path, source_wav, ref_wav, output_wav, device, logger, 
     
     # Perform voice conversion
     logger.info("Performing voice conversion...")
-    converted_features = convert_voice(rcop_model, source_ssl_features, ref_spk_embed, device)
+    converted_features = convert_voice(
+        rcop_model, source_ssl_features, source_spk_embed, ref_spk_embed, device
+    )
     
     logger.info(f"Converted features shape: {converted_features.shape}")
     
@@ -283,7 +286,7 @@ def main():
     # Set seed for reproducibility
     set_seed(Config().seed)
     logger.info(f"Using random seed: {Config().seed}")
-
+    
     # Perform inference
     try:
         results = inference(

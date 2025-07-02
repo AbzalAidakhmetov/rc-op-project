@@ -3,11 +3,11 @@
 import argparse
 import os
 
-# Mitigate threading issues with BLAS libraries (for resource-limited environments)
-# This must be done BEFORE importing torch, numpy, etc.
-os.environ['OPENBLAS_NUM_THREADS'] = '1'
-os.environ['MKL_NUM_THREADS'] = '1'
-os.environ['OMP_NUM_THREADS'] = '1'
+# --- Environment Setup ---
+# This must be done BEFORE importing torch, numpy, etc. to mitigate threading issues.
+from utils.environment import setup_environment
+setup_environment()
+# -------------------------
 
 import torch
 import numpy as np
@@ -21,72 +21,9 @@ from data.vctk import create_dataloader
 from models.rcop import RCOP
 from utils.logging import setup_logger
 from utils.phonemes import get_num_phones
-
-def set_seed(seed):
-    """Set random seeds for reproducibility."""
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
-def load_model_from_checkpoint(checkpoint_path, num_speakers, num_phones, device):
-    """Load RCOP model from checkpoint."""
-    config = Config()
-    
-    # Load checkpoint first to get metadata
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    # Try to extract num_speakers from checkpoint metadata
-    if 'num_speakers' in checkpoint:
-        num_speakers = checkpoint['num_speakers']
-    elif 'model_state_dict' in checkpoint:
-        # Infer from model state dict if available
-        state_dict = checkpoint['model_state_dict']
-        if 'sp_clf.weight' in state_dict:
-            num_speakers = state_dict['sp_clf.weight'].size(0)
-    
-    # Initialize model
-    model = RCOP(
-        d_spk=config.d_spk,
-        d_ssl=config.d_ssl,
-        n_phones=num_phones,
-        n_spk=num_speakers
-    )
-    
-    # Load checkpoint
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(device)
-    model.eval()
-    
-    return model, num_speakers
-
-def extract_features(audio, wavlm_processor, wavlm_model, voice_encoder, device):
-    """Extract SSL features and speaker embeddings."""
-    
-    # Ensure audio is the right shape and on CPU for processing
-    if audio.dim() == 1:
-        audio_np = audio.numpy()
-    else:
-        audio_np = audio.squeeze().numpy()
-    
-    # Extract SSL features with WavLM
-    inputs = wavlm_processor(audio_np, sampling_rate=16000, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    
-    with torch.no_grad():
-        ssl_outputs = wavlm_model(**inputs)
-        ssl_features = ssl_outputs.last_hidden_state.squeeze(0)  # (T, d_ssl)
-    
-    # Extract speaker embedding with Resemblyzer
-    with torch.no_grad():
-        # Resemblyzer expects numpy array
-        spk_embed = voice_encoder.embed_utterance(audio_np)
-        spk_embed = torch.from_numpy(spk_embed).float().to(device)  # (d_spk,)
-    
-    return ssl_features, spk_embed
+from utils.environment import set_seed
+from utils.features import extract_features
+from utils.checkpoint import load_model_from_checkpoint
 
 def evaluate_speaker_classification(model, dataloader, wavlm_processor, wavlm_model, voice_encoder, device, logger):
     """Evaluate speaker classification accuracy."""
@@ -95,7 +32,7 @@ def evaluate_speaker_classification(model, dataloader, wavlm_processor, wavlm_mo
     total = 0
     
     with torch.no_grad():
-        for audio, spk_id, wav_path in tqdm(dataloader, desc="Evaluating speaker classification"):
+        for audio, spk_id, wav_path, _ in tqdm(dataloader, desc="Evaluating speaker classification"):
             try:
                 # Extract features
                 ssl_features, spk_embed = extract_features(
@@ -128,7 +65,7 @@ def evaluate_speaker_disentanglement(model, dataloader, wavlm_processor, wavlm_m
     content_features = {}
     
     with torch.no_grad():
-        for audio, spk_id, wav_path in tqdm(dataloader, desc="Extracting features for disentanglement"):
+        for audio, spk_id, wav_path, _ in tqdm(dataloader, desc="Extracting features for disentanglement"):
             try:
                 # Extract features
                 ssl_features, spk_embed = extract_features(
@@ -174,7 +111,7 @@ def evaluate_speaker_disentanglement(model, dataloader, wavlm_processor, wavlm_m
     if not content_similarities or not speaker_similarities:
         logger.warning("Could not compute similarity scores. This typically requires more than one sample per speaker in the evaluation set.")
         return 0, 0
-
+    
     avg_content_sim = np.mean(content_similarities) if content_similarities else 0
     avg_speaker_sim = np.mean(speaker_similarities) if speaker_similarities else 0
     
@@ -183,7 +120,7 @@ def evaluate_speaker_disentanglement(model, dataloader, wavlm_processor, wavlm_m
     
     return avg_content_sim, avg_speaker_sim
 
-def evaluate_model(checkpoint_path, data_root, device, logger, subset=100):
+def evaluate_model(checkpoint_path, data_root, device, logger, subset=100, max_duration_s=20):
     """Comprehensive model evaluation."""
     logger.info(f"Evaluating model from {checkpoint_path}")
     
@@ -194,7 +131,8 @@ def evaluate_model(checkpoint_path, data_root, device, logger, subset=100):
         target_sr=config.target_sr,
         subset=subset,
         batch_size=1,
-        shuffle=False
+        shuffle=False,
+        max_duration_s=max_duration_s
     )
     
     num_speakers_in_dataset = dataset.get_num_speakers()
@@ -248,6 +186,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda", help="Device to use")
     parser.add_argument("--subset", type=int, default=100, help="Subset size for evaluation")
     parser.add_argument("--log_dir", type=str, default="logs", help="Directory for logs")
+    parser.add_argument("--max_duration", type=int, default=15, help="Maximum audio duration in seconds to filter dataset.")
     
     args = parser.parse_args()
     
@@ -262,9 +201,9 @@ def main():
     # Set seed for reproducibility
     set_seed(Config().seed)
     logger.info(f"Using random seed: {Config().seed}")
-
+    
     # Evaluate model
-    results = evaluate_model(args.ckpt, args.data_root, device, logger, args.subset)
+    results = evaluate_model(args.ckpt, args.data_root, device, logger, args.subset, args.max_duration)
     
     logger.info("Evaluation completed!")
 
