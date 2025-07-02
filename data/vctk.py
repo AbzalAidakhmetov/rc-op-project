@@ -9,6 +9,7 @@ from typing import List, Tuple, Optional
 import random
 from resampy import resample
 from tqdm import tqdm
+from torch.nn.utils.rnn import pad_sequence
 
 class VCTKDataset(Dataset):
     """VCTK dataset for voice conversion training."""
@@ -130,8 +131,14 @@ def collate_fn(batch):
     """Custom collate function to handle variable length audio."""
     audios, spk_ids, wav_paths, phone_id_lists = zip(*batch)
     
-    # Currently batch_size == 1; simply unwrap first elements
-    return audios[0], torch.tensor(spk_ids[0]), wav_paths[0], phone_id_lists[0]
+    # Pad audio and phoneme sequences
+    audios_padded = pad_sequence(list(audios), batch_first=True, padding_value=0)
+    phone_ids_padded = pad_sequence([torch.tensor(p) for p in phone_id_lists], batch_first=True, padding_value=0)
+    
+    # Create attention mask for the audio
+    attention_mask = (audios_padded != 0).long()
+    
+    return audios_padded, torch.tensor(spk_ids), wav_paths, phone_ids_padded, attention_mask
 
 def create_dataloader(data_root: str, 
                      target_sr: int = 16000,
@@ -141,9 +148,6 @@ def create_dataloader(data_root: str,
                      num_workers: int = 0,
                      max_duration_s: int = 20):
     """Create a VCTK dataloader."""
-    if batch_size != 1:
-        raise ValueError("This implementation currently supports batch_size=1 only. Update collate_fn for larger batches.")
-    
     dataset = VCTKDataset(data_root, target_sr, subset, max_duration_s)
     
     dataloader = DataLoader(

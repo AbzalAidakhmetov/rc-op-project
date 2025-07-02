@@ -57,106 +57,115 @@ def train_epoch(model, dataloader, optimizer, criterion_ce, criterion_l1, device
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
     
-    for batch_idx, (audio, spk_id, wav_path, phone_ids) in enumerate(pbar):
+    for batch_idx, (audios_padded, spk_ids, wav_paths, phone_ids_padded, attention_mask) in enumerate(pbar):
         optimizer.zero_grad()
         
-        try:
-            # Extract features
-            ssl_features, spk_embed = extract_features(
-                audio, wavlm_processor, 
-                wavlm_model, 
-                voice_encoder, 
-                device
-            )
+        batch_loss = 0
+        
+        # Process each item in the batch
+        for i in range(audios_padded.size(0)):
+            audio = audios_padded[i]
+            spk_id = spk_ids[i]
+            wav_path = wav_paths[i]
+            phone_ids = phone_ids_padded[i].tolist()
+            mask = attention_mask[i]
             
-            # Forward pass
-            ph_logits, sp_logits, pred_mels = model(ssl_features, spk_embed, lambd)
-            
-            # ----------------------------------------------------------------
-            # Derive phoneme targets from the VCTK transcription that matches
-            # the current wav.  VCTK keeps per-utterance text files in
-            #   <root>/txt/<speaker>/<utt_id>.txt
-            # Example wav:  wav48_silence_trimmed/p225/p225_001_mic1.flac
-            # Corresponding txt:            txt/p225/p225_001.txt
-            # We map the wav path to its txt path, load the transcript, convert
-            # to IPA phones and finally to IDs.  The phone sequence is then
-            # stretched/repeated to the frame count T so that each SSL frame
-            # receives a target label.  If anything goes wrong we gracefully
-            # fall back to a "UNK" label so training can continue.
-            # ----------------------------------------------------------------
+            # Remove padding before feature extraction
+            unpadded_audio = audio[mask == 1]
+
             try:
-                if len(phone_ids) == 0:
-                    raise ValueError("Empty phone sequence from transcript")
+                # Extract features
+                ssl_features, spk_embed = extract_features(
+                    unpadded_audio, wavlm_processor, 
+                    wavlm_model, 
+                    voice_encoder, 
+                    device
+                )
+                
+                # Forward pass
+                ph_logits, sp_logits, pred_mels = model(ssl_features, spk_embed, lambd)
+                
+                # --- Phoneme targets ---
+                try:
+                    if len(phone_ids) == 0:
+                        raise ValueError("Empty phone sequence from transcript")
 
-                # 4. Expand / repeat to match number of frames T
-                import math
-                T          = ph_logits.size(0)
-                repeats    = math.ceil(T / len(phone_ids))
-                expanded   = (phone_ids * repeats)[:T]
-                ph_targets = torch.tensor(expanded, dtype=torch.long, device=device)
+                    # Remove padding from phoneme ids
+                    phone_ids = [p for p in phone_ids if p != 0]
 
+                    # 4. Expand / repeat to match number of frames T
+                    import math
+                    T          = ph_logits.size(0)
+                    repeats    = math.ceil(T / len(phone_ids))
+                    expanded   = (phone_ids * repeats)[:T]
+                    ph_targets = torch.tensor(expanded, dtype=torch.long, device=device)
+
+                except Exception as e:
+                    logger.warning(f"Skipping sample {i} in batch {batch_idx} due to error: {e}")
+                    continue
+                
+                sp_targets = spk_id.to(device)
+                
+                # --- Reconstruction Target ---
+                gt_mels = mel_spectrogram(unpadded_audio.to(device))
+                
+                # Match dimensions (pad or trim predicted mels)
+                T_gt = gt_mels.size(-1)
+                T_pred = pred_mels.size(0)
+                
+                # WavLM features may have slightly different T, so we align
+                if T_pred > T_gt:
+                    pred_mels_aligned = pred_mels[:T_gt, :]
+                else:
+                    pred_mels_aligned = torch.nn.functional.pad(pred_mels, (0, 0, 0, T_gt - T_pred))
+                
+                # The mel spectrogram transform returns (n_channels, n_mels, time)
+                # We need (time, n_mels) to match the model output
+                gt_mels_aligned = gt_mels.squeeze(0).transpose(0, 1)
+
+                # Compute losses
+                ph_loss = criterion_ce(ph_logits, ph_targets)
+                sp_loss = criterion_ce(sp_logits, sp_targets.unsqueeze(0))
+                recon_loss = criterion_l1(pred_mels_aligned, gt_mels_aligned)
+                
+                # Total loss (with weights from config)
+                item_loss = (
+                    config.lambda_ph * ph_loss + 
+                    config.lambda_sp * sp_loss + 
+                    config.lambda_recon * recon_loss
+                )
+                
+                batch_loss += item_loss
+                
+                # Update running losses
+                total_loss += item_loss.item()
+                total_ph_loss += ph_loss.item()
+                total_sp_loss += sp_loss.item()
+                total_recon_loss += recon_loss.item()
+                
             except Exception as e:
-                logger.warning(f"Skipping batch {batch_idx} due to error: {e}")
+                logger.warning(f"Skipping sample {i} in batch {batch_idx} due to error: {e}")
                 continue
-            
-            sp_targets = spk_id.to(device)
-            
-            # --- Reconstruction Target ---
-            gt_mels = mel_spectrogram(audio.to(device))
-            
-            # Match dimensions (pad or trim predicted mels)
-            T_gt = gt_mels.size(-1)
-            T_pred = pred_mels.size(0)
-            
-            # WavLM features may have slightly different T, so we align
-            if T_pred > T_gt:
-                pred_mels_aligned = pred_mels[:T_gt, :]
-            else:
-                pred_mels_aligned = torch.nn.functional.pad(pred_mels, (0, 0, 0, T_gt - T_pred))
-            
-            # The mel spectrogram transform returns (n_channels, n_mels, time)
-            # We need (time, n_mels) to match the model output
-            gt_mels_aligned = gt_mels.squeeze(0).transpose(0, 1)
 
-            # Compute losses
-            ph_loss = criterion_ce(ph_logits, ph_targets)
-            sp_loss = criterion_ce(sp_logits, sp_targets.unsqueeze(0))
-            recon_loss = criterion_l1(pred_mels_aligned, gt_mels_aligned)
-            
-            # Total loss (with weights from config)
-            total_batch_loss = (
-                config.lambda_ph * ph_loss + 
-                config.lambda_sp * sp_loss + 
-                config.lambda_recon * recon_loss
-            )
-            
-            # Backward pass
-            total_batch_loss.backward()
+        # Backward pass on the average batch loss
+        if batch_loss != 0:
+            avg_batch_loss = batch_loss / audios_padded.size(0)
+            avg_batch_loss.backward()
             optimizer.step()
-            
-            # Update running losses
-            total_loss += total_batch_loss.item()
-            total_ph_loss += ph_loss.item()
-            total_sp_loss += sp_loss.item()
-            total_recon_loss += recon_loss.item()
-            
-            # Update progress bar
-            pbar.set_postfix({
-                'Loss': f'{total_batch_loss.item():.4f}',
-                'Ph': f'{ph_loss.item():.4f}',
-                'Sp': f'{sp_loss.item():.4f}',
-                'Recon': f'{recon_loss.item():.4f}',
-                'λ': f'{lambd:.3f}'
-            })
-            
-        except Exception as e:
-            logger.warning(f"Skipping batch {batch_idx} due to error: {e}")
-            continue
+        
+        # Update progress bar
+        pbar.set_postfix({
+            'Loss': f'{avg_batch_loss.item() if "avg_batch_loss" in locals() else 0:.4f}',
+            'Ph': f'{ph_loss.item() if "ph_loss" in locals() else 0:.4f}',
+            'Sp': f'{sp_loss.item() if "sp_loss" in locals() else 0:.4f}',
+            'Recon': f'{recon_loss.item() if "recon_loss" in locals() else 0:.4f}',
+            'λ': f'{lambd:.3f}'
+        })
     
-    avg_loss = total_loss / len(dataloader)
-    avg_ph_loss = total_ph_loss / len(dataloader)
-    avg_sp_loss = total_sp_loss / len(dataloader)
-    avg_recon_loss = total_recon_loss / len(dataloader)
+    avg_loss = total_loss / (len(dataloader.dataset) if len(dataloader.dataset) > 0 else 1)
+    avg_ph_loss = total_ph_loss / (len(dataloader.dataset) if len(dataloader.dataset) > 0 else 1)
+    avg_sp_loss = total_sp_loss / (len(dataloader.dataset) if len(dataloader.dataset) > 0 else 1)
+    avg_recon_loss = total_recon_loss / (len(dataloader.dataset) if len(dataloader.dataset) > 0 else 1)
     
     logger.info(f"Epoch {epoch+1}: Loss={avg_loss:.4f}, Ph={avg_ph_loss:.4f}, Sp={avg_sp_loss:.4f}, Recon={avg_recon_loss:.4f}, λ={lambd:.3f}")
     

@@ -39,8 +39,8 @@ def evaluate_speaker_classification(model, dataloader, wavlm_processor, wavlm_mo
                     audio, wavlm_processor, wavlm_model, voice_encoder, device
                 )
                 
-                # Forward pass
-                ph_logits, sp_logits = model(ssl_features, spk_embed, lambd=1.0)
+                # Forward pass - ignore the predicted mels for this evaluation
+                ph_logits, sp_logits, _ = model(ssl_features, spk_embed, lambd=1.0)
                 
                 # Predict speaker
                 predicted = sp_logits.argmax(dim=1)

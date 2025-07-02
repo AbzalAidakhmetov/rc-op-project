@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from typing import List
 from .grad_reverse import grad_reverse
 from .projection   import orthogonal_project
 
@@ -23,7 +24,7 @@ class RCOP(nn.Module):
         self.sp_clf       = nn.Linear(d_ssl, n_spk)
         
         # Decoder with residual blocks for improved gradient flow
-        decoder_layers = [nn.Linear(d_ssl, d_ssl)]
+        decoder_layers: List[nn.Module] = [nn.Linear(d_ssl, d_ssl)]
         for _ in range(n_res_blocks):
             decoder_layers.append(ResidualBlock(d_ssl))
         decoder_layers.append(nn.Linear(d_ssl, n_mels))
