@@ -57,14 +57,14 @@ class VCTKDataset(Dataset):
         if original_count > 0:
             removed_count = original_count - len(wav_files)
             print(f"Filtered out {removed_count} files (> {max_duration_s}s). Kept {len(wav_files)} files.")
-
+        
         if not wav_files:
             raise ValueError(f"No valid audio-text pairs found in subdirectories of {wav_parent_dir}")
             
         # Optional subset for faster training (before phoneme processing)
         if subset and subset < len(wav_files):
             wav_files = random.sample(wav_files, subset)
-
+            
         # Precompute phoneme IDs only for the selected wav_files
         from utils.phonemes import text_to_phones, phones_to_ids, get_num_phones
         for wav_path, speaker_id, txt_path in tqdm(wav_files, desc="Phonemizing"):

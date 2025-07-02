@@ -33,12 +33,13 @@ def load_model_from_checkpoint(checkpoint_path, num_speakers, num_phones, device
     
     return model, num_speakers
 
-def save_checkpoint(model, optimizer, epoch, loss, save_path, num_speakers=None, num_phones=None):
+def save_checkpoint(model, optimizer, scheduler, epoch, loss, save_path, num_speakers=None, num_phones=None):
     """Save model checkpoint."""
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
         'loss': loss,
     }
     

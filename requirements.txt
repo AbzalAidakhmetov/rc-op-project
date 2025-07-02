@@ -18,5 +18,8 @@ datasets>=2.19
 numpy>=1.23,<2
 tqdm>=4.66
 
+# Experiment tracking
+wandb>=0.17
+
 # 🔗 Add your specific vocoder implementation below if/when it lands on PyPI
 # hifigan-vocoder==0.x.x

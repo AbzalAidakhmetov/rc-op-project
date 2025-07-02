@@ -18,6 +18,7 @@ from tqdm import tqdm
 from transformers import WavLMModel, Wav2Vec2FeatureExtractor
 from resemblyzer import VoiceEncoder
 import torchaudio.transforms as T
+import wandb
 
 from config import Config
 from data.vctk import create_dataloader
@@ -44,66 +45,63 @@ def load_pretrained_models(device):
     
     return wavlm_processor, wavlm_model, voice_encoder
 
-def train_epoch(model, dataloader, optimizer, criterion_ce, criterion_l1, device, epoch, total_epochs, logger, config, wavlm_processor, wavlm_model, voice_encoder, mel_spectrogram):
+def train_epoch(model, dataloader, optimizer, criterion_ph, criterion_sp, criterion_l1, device, epoch, total_epochs, logger, config, wavlm_processor, wavlm_model, voice_encoder, mel_spectrogram):
     """Train for one epoch."""
     model.train()
-    total_loss = 0
-    total_ph_loss = 0
-    total_sp_loss = 0
-    total_recon_loss = 0
+    total_loss, total_ph_loss, total_sp_loss, total_recon_loss = 0, 0, 0, 0
     
-    # Lambda schedule
     lambd = (epoch + 1) / total_epochs if total_epochs > 0 else 1.0
-    
     pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
     
     for batch_idx, (audios_padded, spk_ids, wav_paths, phone_ids_padded, attention_mask) in enumerate(pbar):
         optimizer.zero_grad()
         
-        batch_loss = 0
+        batch_loss = torch.tensor(0.0, device=device)
+        processed_in_batch = 0
         
         # Process each item in the batch
         for i in range(audios_padded.size(0)):
             audio = audios_padded[i]
             spk_id = spk_ids[i]
-            wav_path = wav_paths[i]
-            phone_ids = phone_ids_padded[i].tolist()
+            phone_ids_list = phone_ids_padded[i].tolist()
             mask = attention_mask[i]
             
             # Remove padding before feature extraction
             unpadded_audio = audio[mask == 1]
-
+            if unpadded_audio.nelement() == 0:
+                continue
+        
             try:
                 # Extract features
                 ssl_features, spk_embed = extract_features(
-                    unpadded_audio, wavlm_processor, 
-                    wavlm_model, 
-                    voice_encoder, 
-                    device
+                    unpadded_audio, wavlm_processor, wavlm_model, voice_encoder, device
                 )
                 
                 # Forward pass
                 ph_logits, sp_logits, pred_mels = model(ssl_features, spk_embed, lambd)
-                
-                # --- Phoneme targets ---
-                try:
-                    if len(phone_ids) == 0:
-                        raise ValueError("Empty phone sequence from transcript")
-
-                    # Remove padding from phoneme ids
-                    phone_ids = [p for p in phone_ids if p != 0]
-
-                    # 4. Expand / repeat to match number of frames T
-                    import math
-                    T          = ph_logits.size(0)
-                    repeats    = math.ceil(T / len(phone_ids))
-                    expanded   = (phone_ids * repeats)[:T]
-                    ph_targets = torch.tensor(expanded, dtype=torch.long, device=device)
-
-                except Exception as e:
-                    logger.warning(f"Skipping sample {i} in batch {batch_idx} due to error: {e}")
+            
+                # --- Phoneme targets for CTC Loss ---
+                # The padding value from collate_fn is 0, which corresponds to our BLANK token.
+                # text_to_phones does not produce BLANK, so we can safely filter padding by checking for 0.
+                phone_ids = [p for p in phone_ids_list if p != 0]
+                if not phone_ids:
+                    logger.warning(f"Skipping sample {i} in batch {batch_idx} due to empty phone sequence.")
                     continue
                 
+                ph_targets = torch.tensor(phone_ids, dtype=torch.long)
+                ph_target_lengths = torch.tensor([len(phone_ids)], dtype=torch.long)
+
+                # --- Input for CTC Loss ---
+                # Model output needs to be log probabilities.
+                ph_log_probs = nn.functional.log_softmax(ph_logits, dim=-1)
+                
+                # CTC Loss expects input of shape (T, N, C), where T=time, N=batch, C=classes.
+                # In this loop, our batch size N is 1.
+                T = ph_log_probs.size(0)
+                ph_log_probs_for_ctc = ph_log_probs.unsqueeze(1)
+                input_lengths = torch.tensor([T], dtype=torch.long)
+
+                # --- Speaker targets ---
                 sp_targets = spk_id.to(device)
                 
                 # --- Reconstruction Target ---
@@ -122,10 +120,10 @@ def train_epoch(model, dataloader, optimizer, criterion_ce, criterion_l1, device
                 # The mel spectrogram transform returns (n_channels, n_mels, time)
                 # We need (time, n_mels) to match the model output
                 gt_mels_aligned = gt_mels.squeeze(0).transpose(0, 1)
-
+            
                 # Compute losses
-                ph_loss = criterion_ce(ph_logits, ph_targets)
-                sp_loss = criterion_ce(sp_logits, sp_targets.unsqueeze(0))
+                ph_loss = criterion_ph(ph_log_probs_for_ctc, ph_targets, input_lengths, ph_target_lengths)
+                sp_loss = criterion_sp(sp_logits, sp_targets.unsqueeze(0))
                 recon_loss = criterion_l1(pred_mels_aligned, gt_mels_aligned)
                 
                 # Total loss (with weights from config)
@@ -136,8 +134,9 @@ def train_epoch(model, dataloader, optimizer, criterion_ce, criterion_l1, device
                 )
                 
                 batch_loss += item_loss
-                
-                # Update running losses
+                processed_in_batch += 1
+            
+                # Update running losses for logging
                 total_loss += item_loss.item()
                 total_ph_loss += ph_loss.item()
                 total_sp_loss += sp_loss.item()
@@ -148,28 +147,29 @@ def train_epoch(model, dataloader, optimizer, criterion_ce, criterion_l1, device
                 continue
 
         # Backward pass on the average batch loss
-        if batch_loss != 0:
-            avg_batch_loss = batch_loss / audios_padded.size(0)
+        if processed_in_batch > 0:
+            avg_batch_loss = batch_loss / processed_in_batch
             avg_batch_loss.backward()
             optimizer.step()
-        
-        # Update progress bar
-        pbar.set_postfix({
-            'Loss': f'{avg_batch_loss.item() if "avg_batch_loss" in locals() else 0:.4f}',
-            'Ph': f'{ph_loss.item() if "ph_loss" in locals() else 0:.4f}',
-            'Sp': f'{sp_loss.item() if "sp_loss" in locals() else 0:.4f}',
-            'Recon': f'{recon_loss.item() if "recon_loss" in locals() else 0:.4f}',
-            'λ': f'{lambd:.3f}'
-        })
-    
-    avg_loss = total_loss / (len(dataloader.dataset) if len(dataloader.dataset) > 0 else 1)
-    avg_ph_loss = total_ph_loss / (len(dataloader.dataset) if len(dataloader.dataset) > 0 else 1)
-    avg_sp_loss = total_sp_loss / (len(dataloader.dataset) if len(dataloader.dataset) > 0 else 1)
-    avg_recon_loss = total_recon_loss / (len(dataloader.dataset) if len(dataloader.dataset) > 0 else 1)
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'Loss': f'{avg_batch_loss.item():.4f}',
+                'Ph': f'{ph_loss.item():.4f}',
+                'Sp': f'{sp_loss.item():.4f}',
+                'Recon': f'{recon_loss.item():.4f}',
+                'λ': f'{lambd:.3f}'
+            })
+            
+    num_samples = len(dataloader.dataset) if len(dataloader.dataset) > 0 else 1
+    avg_loss = total_loss / num_samples
+    avg_ph_loss = total_ph_loss / num_samples
+    avg_sp_loss = total_sp_loss / num_samples
+    avg_recon_loss = total_recon_loss / num_samples
     
     logger.info(f"Epoch {epoch+1}: Loss={avg_loss:.4f}, Ph={avg_ph_loss:.4f}, Sp={avg_sp_loss:.4f}, Recon={avg_recon_loss:.4f}, λ={lambd:.3f}")
     
-    return avg_loss
+    return avg_loss, avg_ph_loss, avg_sp_loss, avg_recon_loss, lambd
 
 def main():
     parser = argparse.ArgumentParser(description="Train RC-OP model")
@@ -187,6 +187,10 @@ def main():
     parser.add_argument("--lambda_ph", type=float, default=None, help="Weight for phoneme loss")
     parser.add_argument("--lambda_sp", type=float, default=None, help="Weight for speaker loss")
     parser.add_argument("--lambda_recon", type=float, default=None, help="Weight for reconstruction loss")
+    parser.add_argument("--wandb_project", type=str, default="rc-op-project", help="Weights & Biases project name")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="Weights & Biases entity (username or team)")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="A specific name for the W&B run")
+    parser.add_argument("--no_wandb", action="store_true", help="Disable Weights & Biases logging")
     
     args = parser.parse_args()
     
@@ -212,6 +216,22 @@ def main():
     
     log_config(logger, config)
     
+    # --- W&B Setup ---
+    if not args.no_wandb:
+        try:
+            wandb.init(
+                name=args.wandb_run_name,
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                config={**config.__dict__, **vars(args)}
+            )
+            if wandb.run:
+                config.run_name = wandb.run.name
+                logger.info(f"Weights & Biases integration enabled. Run name: {wandb.run.name}")
+        except ImportError:
+            logger.warning("wandb package not found, disabling W&B. Run `pip install wandb`.")
+            args.no_wandb = True
+
     # Set seed
     set_seed(config.seed)
     
@@ -260,12 +280,17 @@ def main():
         n_spk=num_speakers
     )
     rcop_model.to(device)
+    
+    if not args.no_wandb:
+        wandb.watch(rcop_model, log="all", log_freq=250)
 
     log_model_summary(logger, rcop_model)
     
     # Setup optimizer and losses
     optimizer = optim.Adam(rcop_model.parameters(), lr=config.lr)
-    criterion_ce = nn.CrossEntropyLoss()
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.5, verbose=True)
+    criterion_ph = nn.CTCLoss(blank=0, zero_infinity=True)  # BLANK token is at index 0
+    criterion_sp = nn.CrossEntropyLoss()
     criterion_l1 = nn.L1Loss()
     
     # Resume from checkpoint if specified
@@ -275,25 +300,46 @@ def main():
         checkpoint = torch.load(args.resume, map_location=device)
         rcop_model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            logger.info("Resumed scheduler state.")
         start_epoch = checkpoint['epoch'] + 1
         logger.info(f"Resumed from epoch {start_epoch}")
     
     # Training loop
     logger.info("Starting training...")
     for epoch in range(start_epoch, config.epochs):
-        avg_loss = train_epoch(
-            rcop_model, dataloader, optimizer, criterion_ce, criterion_l1,
+        avg_loss, avg_ph_loss, avg_sp_loss, avg_recon_loss, lambd = train_epoch(
+            rcop_model, dataloader, optimizer, criterion_ph, criterion_sp, criterion_l1,
             device, epoch, config.epochs, logger, config,
             wavlm_processor, wavlm_model, voice_encoder, mel_spectrogram
         )
         
+        # Log metrics to W&B
+        if not args.no_wandb:
+            wandb.log({
+                "epoch": epoch + 1,
+                "avg_loss": avg_loss,
+                "avg_ph_loss": avg_ph_loss,
+                "avg_sp_loss": avg_sp_loss,
+                "avg_recon_loss": avg_recon_loss,
+                "lambda": lambd,
+                "learning_rate": optimizer.param_groups[0]['lr']
+            })
+
+        # Step the LR scheduler
+        scheduler.step(avg_loss)
+        
         # Save checkpoint periodically and at the end
         if (epoch + 1) % args.save_interval == 0 or (epoch + 1) == config.epochs:
             checkpoint_path = os.path.join(args.save_dir, f"rcop_epoch{epoch+1}.pt")
-            save_checkpoint(rcop_model, optimizer, epoch, avg_loss, checkpoint_path, num_speakers, num_phones)
+            save_checkpoint(rcop_model, optimizer, scheduler, epoch, avg_loss, checkpoint_path, num_speakers, num_phones)
             logger.info(f"Saved checkpoint: {checkpoint_path}")
     
     logger.info("Training completed!")
+
+    if not args.no_wandb:
+        wandb.finish()
 
 if __name__ == "__main__":
     main() 

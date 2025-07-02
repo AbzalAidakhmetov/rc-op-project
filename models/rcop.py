@@ -36,12 +36,13 @@ class RCOP(nn.Module):
         proj_feats = orthogonal_project(ssl_frames, axis)   # (T, d_ssl)
 
         ph_logits  = self.ph_clf(proj_feats)                # (T, n_phones)
-        
+
         # Vocoder head produces the mel-spectrogram for reconstruction
         pred_mels = self.vocoder_head(proj_feats)           # (T, n_mels)
 
-        mean_feat  = proj_feats.mean(0)                     # (d_ssl)
-        rev_feat   = grad_reverse(mean_feat, lambd)
-        sp_logits  = self.sp_clf(rev_feat.unsqueeze(0))     # (1, n_spk)
+        # Adversarial speaker classification is now frame-wise for robustness
+        rev_feats   = grad_reverse(proj_feats, lambd)       # (T, d_ssl)
+        sp_logits_per_frame = self.sp_clf(rev_feats)        # (T, n_spk)
+        sp_logits = sp_logits_per_frame.mean(0, keepdim=True) # (1, n_spk)
 
         return ph_logits, sp_logits, pred_mels 
