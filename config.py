@@ -17,4 +17,9 @@ class Config:
     # training
     epochs:        int     = 20
     lr:            float   = 1e-4
-    lambda_ramp:   bool    = True 
+    lambda_ramp:   bool    = True
+    
+    # loss weights
+    lambda_ph:     float   = 1.0
+    lambda_sp:     float   = 1.0
+    lambda_recon:  float   = 2.5 

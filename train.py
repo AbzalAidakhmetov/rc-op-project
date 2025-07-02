@@ -44,7 +44,7 @@ def load_pretrained_models(device):
     
     return wavlm_processor, wavlm_model, voice_encoder
 
-def train_epoch(model, dataloader, optimizer, criterion_ce, criterion_l1, device, epoch, total_epochs, logger, wavlm_processor, wavlm_model, voice_encoder, mel_spectrogram):
+def train_epoch(model, dataloader, optimizer, criterion_ce, criterion_l1, device, epoch, total_epochs, logger, config, wavlm_processor, wavlm_model, voice_encoder, mel_spectrogram):
     """Train for one epoch."""
     model.train()
     total_loss = 0
@@ -123,8 +123,12 @@ def train_epoch(model, dataloader, optimizer, criterion_ce, criterion_l1, device
             sp_loss = criterion_ce(sp_logits, sp_targets.unsqueeze(0))
             recon_loss = criterion_l1(pred_mels_aligned, gt_mels_aligned)
             
-            # Total loss
-            total_batch_loss = ph_loss + sp_loss + recon_loss
+            # Total loss (with weights from config)
+            total_batch_loss = (
+                config.lambda_ph * ph_loss + 
+                config.lambda_sp * sp_loss + 
+                config.lambda_recon * recon_loss
+            )
             
             # Backward pass
             total_batch_loss.backward()
@@ -170,6 +174,10 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     parser.add_argument("--log_dir", type=str, default="logs", help="Directory for logs")
     parser.add_argument("--max_duration", type=int, default=15, help="Maximum audio duration in seconds to filter dataset.")
+    parser.add_argument("--save_interval", type=int, default=20, help="Save a checkpoint every N epochs.")
+    parser.add_argument("--lambda_ph", type=float, default=None, help="Weight for phoneme loss")
+    parser.add_argument("--lambda_sp", type=float, default=None, help="Weight for speaker loss")
+    parser.add_argument("--lambda_recon", type=float, default=None, help="Weight for reconstruction loss")
     
     args = parser.parse_args()
     
@@ -187,6 +195,11 @@ def main():
     config.subset = args.subset
     config.batch_size = args.batch_size
     config.lr = args.lr
+    
+    # Allow overriding loss weights from CLI
+    if args.lambda_ph is not None: config.lambda_ph = args.lambda_ph
+    if args.lambda_sp is not None: config.lambda_sp = args.lambda_sp
+    if args.lambda_recon is not None: config.lambda_recon = args.lambda_recon
     
     log_config(logger, config)
     
@@ -261,14 +274,15 @@ def main():
     for epoch in range(start_epoch, config.epochs):
         avg_loss = train_epoch(
             rcop_model, dataloader, optimizer, criterion_ce, criterion_l1,
-            device, epoch, config.epochs, logger,
+            device, epoch, config.epochs, logger, config,
             wavlm_processor, wavlm_model, voice_encoder, mel_spectrogram
         )
         
-        # Save checkpoint
-        checkpoint_path = os.path.join(args.save_dir, f"rcop_epoch{epoch+1}.pt")
-        save_checkpoint(rcop_model, optimizer, epoch, avg_loss, checkpoint_path, num_speakers, num_phones)
-        logger.info(f"Saved checkpoint: {checkpoint_path}")
+        # Save checkpoint periodically and at the end
+        if (epoch + 1) % args.save_interval == 0 or (epoch + 1) == config.epochs:
+            checkpoint_path = os.path.join(args.save_dir, f"rcop_epoch{epoch+1}.pt")
+            save_checkpoint(rcop_model, optimizer, epoch, avg_loss, checkpoint_path, num_speakers, num_phones)
+            logger.info(f"Saved checkpoint: {checkpoint_path}")
     
     logger.info("Training completed!")
 
