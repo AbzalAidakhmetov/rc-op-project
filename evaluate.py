@@ -18,7 +18,7 @@ from resemblyzer import VoiceEncoder
 from tqdm import tqdm
 
 from config import Config
-from data.vctk import create_dataloader
+from data.vctk import create_dataloader, VCTKArgs
 from models.rcop import RCOP
 from utils.logging import setup_logger
 from utils.phonemes import get_num_phones
@@ -35,23 +35,34 @@ def evaluate_speaker_classification(model, dataloader, wavlm_processor, wavlm_mo
     total = 0
     
     with torch.no_grad():
-        for audio, spk_id, wav_path, _ in tqdm(dataloader, desc="Evaluating speaker classification"):
+        for audio, spk_id, wav_path, _, attention_mask in tqdm(dataloader, desc="Evaluating speaker classification"):
             try:
-                # Extract features
-                ssl_features, spk_embed = extract_features(
-                    audio, wavlm_processor, wavlm_model, voice_encoder, device
-                )
-                
-                # Forward pass - ignore the predicted mels for this evaluation
-                ph_logits, sp_logits, _ = model(ssl_features, spk_embed, lambd=1.0)
-                
-                # Predict speaker
-                predicted = sp_logits.argmax(dim=1)
-                actual = spk_id.to(device)
-                
-                correct += (predicted == actual).sum().item()
-                total += actual.numel()
-                
+                # Features are extracted one-by-one if batch size > 1
+                ssl_features_list, spk_embed_list, spk_id_list = [], [], []
+                for i in range(audio.size(0)):
+                    unpadded_audio = audio[i, :attention_mask[i].sum()]
+                    if unpadded_audio.numel() == 0: continue
+                    
+                    ssl_feats, spk_embed = extract_features(
+                        unpadded_audio, wavlm_processor, wavlm_model, voice_encoder, device
+                    )
+                    ssl_features_list.append(ssl_feats)
+                    spk_embed_list.append(spk_embed)
+                    spk_id_list.append(spk_id[i])
+
+                if not ssl_features_list: continue
+
+                # Process each item from the batch individually
+                for ssl_features, spk_embed, actual_id in zip(ssl_features_list, spk_embed_list, spk_id_list):
+                    # Forward pass needs batch dimension
+                    ph_logits, sp_logits, _ = model(ssl_features.unsqueeze(0), spk_embed.unsqueeze(0), lambd=0.0)
+                    
+                    predicted = sp_logits.argmax(dim=1)
+                    actual = actual_id.to(device).unsqueeze(0)
+                    
+                    correct += (predicted == actual).sum().item()
+                    total += actual.numel()
+
             except Exception as e:
                 logger.warning(f"Skipping sample due to error: {e}")
                 continue
@@ -68,17 +79,24 @@ def evaluate_speaker_disentanglement(model, dataloader, wavlm_processor, wavlm_m
     content_features = {}
     
     with torch.no_grad():
-        for audio, spk_id, wav_path, _ in tqdm(dataloader, desc="Extracting features for disentanglement"):
+        for audio, spk_id, wav_path, _, attention_mask in tqdm(dataloader, desc="Extracting features for disentanglement"):
+            # This evaluation assumes a batch size of 1 for simplicity.
+            if audio.size(0) != 1:
+                logger.warning("Disentanglement evaluation should be run with batch size 1. Skipping batch.")
+                continue
+
             try:
+                unpadded_audio = audio[0, :attention_mask[0].sum()]
+                if unpadded_audio.numel() == 0: continue
+
                 # Extract features
                 ssl_features, spk_embed = extract_features(
-                    audio, wavlm_processor, wavlm_model, voice_encoder, device
+                    unpadded_audio, wavlm_processor, wavlm_model, voice_encoder, device
                 )
                 
                 # Get projected features (content without speaker info)
                 axis = model.W_proj(spk_embed)
-                from models.projection import orthogonal_project
-                proj_feats = orthogonal_project(ssl_features, axis)
+                proj_feats = model.project_orthogonally(ssl_features, axis)
                 
                 # Store mean content features per speaker
                 spk_id_str = str(spk_id.item())
@@ -129,13 +147,16 @@ def evaluate_model(checkpoint_path, data_root, device, logger, subset=100, max_d
     
     # Create dataloader
     config = Config()
-    dataloader, dataset = create_dataloader(
+    vctk_args = VCTKArgs(
         data_root=data_root,
         target_sr=config.target_sr,
         subset=subset,
-        batch_size=1,
+        max_duration_s=max_duration_s,
+    )
+    dataloader, dataset = create_dataloader(
+        args=vctk_args,
+        batch_size=1, # Use batch size 1 for evaluation for simplicity
         shuffle=False,
-        max_duration_s=max_duration_s
     )
     
     num_speakers_in_dataset = dataset.get_num_speakers()
@@ -154,11 +175,10 @@ def evaluate_model(checkpoint_path, data_root, device, logger, subset=100, max_d
     wavlm_model.to(device)
     
     voice_encoder = VoiceEncoder()
-    voice_encoder.eval()
     
     # The number of speakers is determined by the CHECKPOINT.
     # Pass a dummy value for num_speakers; it will be overwritten by the checkpoint metadata.
-    rcop_model, num_speakers_from_ckpt = load_model_from_checkpoint(checkpoint_path, 1, num_phones, device)
+    rcop_model, num_speakers_from_ckpt = load_model_from_checkpoint(checkpoint_path, 0, num_phones, device)
     logger.info(f"Loaded model trained on {num_speakers_from_ckpt} speakers.")
     
     # Evaluate speaker classification
@@ -194,6 +214,7 @@ def main():
     parser.add_argument("--subset", type=int, default=100, help="Subset size for evaluation")
     parser.add_argument("--log_dir", type=str, default="logs", help="Directory for logs")
     parser.add_argument("--max_duration", type=int, default=15, help="Maximum audio duration in seconds to filter dataset.")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for evaluation.")
     
     args = parser.parse_args()
     

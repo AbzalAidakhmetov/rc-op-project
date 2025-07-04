@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 import random
+import traceback
 
 # --- Environment Setup ---
 # This must be done BEFORE importing torch, numpy, etc. to mitigate threading issues.
@@ -11,13 +12,16 @@ from utils.environment import setup_environment
 setup_environment()
 # -------------------------
 
+import numpy as np
 import torch
 torch.set_num_threads(1)
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import WavLMModel, Wav2Vec2FeatureExtractor
+from transformers.modeling_outputs import BaseModelOutput
 from resemblyzer import VoiceEncoder
 import torchaudio.transforms as T
 import wandb
@@ -54,9 +58,9 @@ def load_pretrained_models(device):
     return wavlm_processor, wavlm_model, voice_encoder
 
 def train_epoch(model, dataloader, optimizer, criterion_ph, criterion_sp, criterion_l1, device, epoch, total_epochs, logger, config, wavlm_processor, wavlm_model, voice_encoder, mel_spectrogram):
-    """Train for one epoch."""
+    """Train for one epoch with batch processing."""
     model.train()
-    total_loss, total_ph_loss, total_sp_loss, total_recon_loss = 0, 0, 0, 0
+    running_loss, running_ph_loss, running_sp_loss, running_recon_loss = 0, 0, 0, 0
     num_samples = 0
     
     lambd = (epoch + 1) / total_epochs if total_epochs > 0 else 1.0
@@ -65,190 +69,196 @@ def train_epoch(model, dataloader, optimizer, criterion_ph, criterion_sp, criter
     for batch_idx, (audios_padded, spk_ids, wav_paths, phone_ids_padded, attention_mask) in enumerate(pbar):
         optimizer.zero_grad()
         
-        batch_loss = torch.tensor(0.0, device=device)
-        processed_in_batch = 0
-        
-        # Process each item in the batch
-        for i in range(audios_padded.size(0)):
-            audio = audios_padded[i]
-            spk_id = spk_ids[i]
-            phone_ids_list = phone_ids_padded[i].tolist()
-            mask = attention_mask[i]
-            
-            # Remove padding before feature extraction
-            unpadded_audio = audio[mask == 1]
-            if unpadded_audio.nelement() == 0:
-                continue
-        
-            try:
-                # Extract features
-                ssl_features, spk_embed = extract_features(
-                    unpadded_audio, wavlm_processor, wavlm_model, voice_encoder, device
-                )
-                
-                # Forward pass
-                ph_logits, sp_logits, pred_mels = model(ssl_features, spk_embed, lambd)
-            
-                # --- Phoneme targets for CTC Loss ---
-                # The padding value from collate_fn is 0, which corresponds to our BLANK token.
-                # text_to_phones does not produce BLANK, so we can safely filter padding by checking for 0.
-                phone_ids = [p for p in phone_ids_list if p != 0]
-                if not phone_ids:
-                    logger.warning(f"Skipping sample {i} in batch {batch_idx} due to empty phone sequence.")
-                    continue
-                
-                ph_targets = torch.tensor(phone_ids, dtype=torch.long)
-                ph_target_lengths = torch.tensor([len(phone_ids)], dtype=torch.long)
+        try:
+            # --- Batched Feature Extraction ---
+            # 1. WavLM SSL features (batched)
+            inputs = wavlm_processor(
+                audios_padded.cpu().numpy(),
+                sampling_rate=config.target_sr,
+                return_tensors="pt",
+                padding=True,
+                return_attention_mask=True
+            )
+            inputs['attention_mask'] = inputs['attention_mask'].bool()
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.no_grad():
+                ssl_outputs: BaseModelOutput = wavlm_model(**inputs)
+                ssl_features = ssl_outputs.last_hidden_state  # (N, T_ssl, D)
+                # The attention mask from the processor is for the raw audio, so we calculate
+                # the downsampled feature lengths for CTC loss below.
 
-                # --- Input for CTC Loss ---
-                # Model output needs to be log probabilities.
-                ph_log_probs = nn.functional.log_softmax(ph_logits, dim=-1)
-                
-                # CTC Loss expects input of shape (T, N, C), where T=time, N=batch, C=classes.
-                # In this loop, our batch size N is 1.
-                T = ph_log_probs.size(0)
-                ph_log_probs_for_ctc = ph_log_probs.unsqueeze(1)
-                input_lengths = torch.tensor([T], dtype=torch.long)
-
-                # --- Speaker targets ---
-                sp_targets = spk_id.to(device)
-                
-                # --- Reconstruction Target ---
-                gt_mels = mel_spectrogram(unpadded_audio.to(device))
-                
-                # Match dimensions (pad or trim predicted mels)
-                T_gt = gt_mels.size(-1)
-                T_pred = pred_mels.size(0)
-                
-                # WavLM features may have slightly different T, so we align
-                if T_pred > T_gt:
-                    pred_mels_aligned = pred_mels[:T_gt, :]
-                else:
-                    pred_mels_aligned = torch.nn.functional.pad(pred_mels, (0, 0, 0, T_gt - T_pred))
-                
-                # The mel spectrogram transform returns (n_channels, n_mels, time)
-                # We need (time, n_mels) to match the model output
-                gt_mels_aligned = gt_mels.squeeze(0).transpose(0, 1)
-            
-                # Compute losses
-                ph_loss = criterion_ph(ph_log_probs_for_ctc, ph_targets, input_lengths, ph_target_lengths)
-                sp_loss = criterion_sp(sp_logits, sp_targets.unsqueeze(0))
-                recon_loss = criterion_l1(pred_mels_aligned, gt_mels_aligned)
-                
-                # Total loss (with weights from config)
-                item_loss = (
-                    config.lambda_ph * ph_loss + 
-                    config.lambda_sp * sp_loss + 
-                    config.lambda_recon * recon_loss
-                )
-                
-                batch_loss += item_loss
-                processed_in_batch += 1
-            
-                # Update running losses for logging
-                total_loss += item_loss.item()
-                total_ph_loss += ph_loss.item()
-                total_sp_loss += sp_loss.item()
-                total_recon_loss += recon_loss.item()
-                
-            except Exception as e:
-                logger.warning(f"Skipping sample {i} in batch {batch_idx} due to error: {e}")
+            # 2. Resemblyzer speaker embeddings (looped)
+            spk_embeds = []
+            for i in range(audios_padded.size(0)):
+                unpadded_audio_np = audios_padded[i, :attention_mask[i].sum()].cpu().numpy()
+                if unpadded_audio_np.size == 0: continue
+                spk_embed = voice_encoder.embed_utterance(unpadded_audio_np)
+                spk_embeds.append(spk_embed)
+            if not spk_embeds: continue # Skip batch if all audios are empty
+            spk_embeds = torch.from_numpy(np.array(spk_embeds)).float().to(device) # (N, d_spk)
+            # Ensure we extracted an embedding for every sample in the batch. If not, skip to avoid
+            # tensor dimension mismatches later on.
+            if spk_embeds.size(0) != audios_padded.size(0):
                 continue
 
-        num_samples += processed_in_batch
+            # --- Forward pass ---
+            ph_logits, sp_logits, pred_mels = model(ssl_features, spk_embeds, lambd)
 
-        # Backward pass on the average batch loss
-        if processed_in_batch > 0:
-            avg_batch_loss = batch_loss / processed_in_batch
-            avg_batch_loss.backward()
+            # --- Loss Calculation ---
+            # 1. Phoneme CTC Loss
+            ph_log_probs = F.log_softmax(ph_logits, dim=-1).permute(1, 0, 2) # (T_ssl, N, n_phones)
+            
+            # Correctly calculate the input lengths for CTC loss after WavLM's downsampling
+            raw_audio_lengths = inputs['attention_mask'].sum(dim=1)
+            input_lengths = wavlm_model._get_feat_extract_output_lengths(raw_audio_lengths)
+
+            ph_target_lengths = (phone_ids_padded != 0).sum(dim=1)
+            # --- Move CTC targets and lengths to the correct device ---
+            phone_ids_padded = phone_ids_padded.to(device)
+            ph_target_lengths = ph_target_lengths.to(device)
+            input_lengths = input_lengths.to(device)
+
+            ph_loss = criterion_ph(ph_log_probs, phone_ids_padded, input_lengths, ph_target_lengths)
+
+            # 2. Speaker Classification Loss
+            sp_loss = criterion_sp(sp_logits, spk_ids.to(device))
+
+            # 3. Masked Reconstruction Loss
+            gt_mels = mel_spectrogram(audios_padded.to(device)) # (N, n_mels, T_mel)
+            gt_mels = gt_mels.permute(0, 2, 1) # (N, T_mel, n_mels)
+
+            T_gt = gt_mels.size(1)
+            T_pred = pred_mels.size(1)
+            if T_pred > T_gt:
+                pred_mels_aligned = pred_mels[:, :T_gt, :]
+            else:
+                pred_mels_aligned = F.pad(pred_mels, (0, 0, 0, T_gt - T_pred), 'constant', 0)
+
+            mel_lengths = torch.floor(attention_mask.sum(1) / mel_spectrogram.hop_length).long().to(device)
+            mel_mask = torch.arange(T_gt, device=device)[None, :] < mel_lengths[:, None]
+            mel_mask = mel_mask.unsqueeze(2).expand_as(gt_mels)
+            
+            recon_loss_unreduced = criterion_l1(pred_mels_aligned, gt_mels)
+            recon_loss = (recon_loss_unreduced * mel_mask).sum() / mel_mask.sum()
+
+            # --- Total Loss & Backward Pass ---
+            batch_loss = (config.lambda_ph * ph_loss + 
+                          config.lambda_sp * sp_loss + 
+                          config.lambda_recon * recon_loss)
+            batch_loss.backward()
             optimizer.step()
+
+            # --- Logging ---
+            running_loss += batch_loss.item() * audios_padded.size(0)
+            running_ph_loss += ph_loss.item() * audios_padded.size(0)
+            running_sp_loss += sp_loss.item() * audios_padded.size(0)
+            running_recon_loss += recon_loss.item() * audios_padded.size(0)
+            num_samples += audios_padded.size(0)
             
-            # Update progress bar
             pbar.set_postfix({
-                'Loss': f'{avg_batch_loss.item():.4f}',
-                'Ph': f'{ph_loss.item():.4f}',
-                'Sp': f'{sp_loss.item():.4f}',
-                'Recon': f'{recon_loss.item():.4f}',
-                'λ': f'{lambd:.3f}'
+                'Loss': f'{batch_loss.item():.4f}', 'Ph': f'{ph_loss.item():.4f}',
+                'Sp': f'{sp_loss.item():.4f}', 'Recon': f'{recon_loss.item():.4f}', 'λ': f'{lambd:.3f}'
             })
-            
-    avg_loss = total_loss / num_samples if num_samples > 0 else 0
-    avg_ph_loss = total_ph_loss / num_samples if num_samples > 0 else 0
-    avg_sp_loss = total_sp_loss / num_samples if num_samples > 0 else 0
-    avg_recon_loss = total_recon_loss / num_samples if num_samples > 0 else 0
+
+        except Exception as e:
+            logger.error(f"Skipping batch {batch_idx} due to error: {e}\n{traceback.format_exc()}")
+            continue
+
+    avg_loss = running_loss / num_samples if num_samples > 0 else 0
+    avg_ph_loss = running_ph_loss / num_samples if num_samples > 0 else 0
+    avg_sp_loss = running_sp_loss / num_samples if num_samples > 0 else 0
+    avg_recon_loss = running_recon_loss / num_samples if num_samples > 0 else 0
     
     logger.info(f"Epoch {epoch+1} TRAIN: Loss={avg_loss:.4f}, Ph={avg_ph_loss:.4f}, Sp={avg_sp_loss:.4f}, Recon={avg_recon_loss:.4f}, λ={lambd:.3f}")
     
     return avg_loss, avg_ph_loss, avg_sp_loss, avg_recon_loss, lambd
 
 def validate_epoch(model, dataloader, criterion_ph, criterion_l1, device, logger, config, wavlm_processor, wavlm_model, voice_encoder, mel_spectrogram):
-    """Validate for one epoch."""
+    """Validate for one epoch with batch processing."""
     model.eval()
-    total_val_loss, total_val_ph_loss, total_val_recon_loss = 0, 0, 0
+    running_val_loss, running_val_ph_loss, running_val_recon_loss = 0, 0, 0
     num_samples = 0
 
     with torch.no_grad():
         pbar = tqdm(dataloader, desc="Validating")
         for batch_idx, (audios_padded, spk_ids, wav_paths, phone_ids_padded, attention_mask) in enumerate(pbar):
-            # Process each item in the batch
-            for i in range(audios_padded.size(0)):
-                audio = audios_padded[i]
-                phone_ids_list = phone_ids_padded[i].tolist()
-                mask = attention_mask[i]
-                
-                unpadded_audio = audio[mask == 1]
-                if unpadded_audio.nelement() == 0:
+            try:
+                # --- Batched Feature Extraction ---
+                inputs = wavlm_processor(
+                    audios_padded.cpu().numpy(), sampling_rate=config.target_sr,
+                    return_tensors="pt", padding=True, return_attention_mask=True
+                )
+                inputs['attention_mask'] = inputs['attention_mask'].bool()
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                ssl_outputs: BaseModelOutput = wavlm_model(**inputs)
+                ssl_features = ssl_outputs.last_hidden_state
+                # The attention mask from the processor is for the raw audio, so we calculate
+                # the downsampled feature lengths for CTC loss below.
+
+                spk_embeds = []
+                for i in range(audios_padded.size(0)):
+                    unpadded_audio_np = audios_padded[i, :attention_mask[i].sum()].cpu().numpy()
+                    if unpadded_audio_np.size == 0: continue
+                    spk_embed = voice_encoder.embed_utterance(unpadded_audio_np)
+                    spk_embeds.append(spk_embed)
+                if not spk_embeds: continue
+                spk_embeds = torch.from_numpy(np.array(spk_embeds)).float().to(device)
+                # Skip batch if we failed to get embeddings for every sample
+                if spk_embeds.size(0) != audios_padded.size(0):
                     continue
 
-                try:
-                    ssl_features, spk_embed = extract_features(
-                        unpadded_audio, wavlm_processor, wavlm_model, voice_encoder, device
-                    )
-                    
-                    # Forward pass for validation (no GRL needed)
-                    ph_logits, _, pred_mels = model(ssl_features, spk_embed, lambd=0.0)
-                    
-                    phone_ids = [p for p in phone_ids_list if p != 0]
-                    if not phone_ids:
-                        continue
+                # --- Forward pass (no GRL) ---
+                ph_logits, _, pred_mels = model(ssl_features, spk_embeds, lambd=0.0)
 
-                    ph_targets = torch.tensor(phone_ids, dtype=torch.long)
-                    ph_target_lengths = torch.tensor([len(phone_ids)], dtype=torch.long)
+                # --- Loss Calculation ---
+                # 1. Phoneme CTC Loss
+                ph_log_probs = F.log_softmax(ph_logits, dim=-1).permute(1, 0, 2)
 
-                    ph_log_probs = nn.functional.log_softmax(ph_logits, dim=-1)
-                    T = ph_log_probs.size(0)
-                    ph_log_probs_for_ctc = ph_log_probs.unsqueeze(1)
-                    input_lengths = torch.tensor([T], dtype=torch.long)
+                # Correctly calculate the input lengths for CTC loss after WavLM's downsampling
+                raw_audio_lengths = inputs['attention_mask'].sum(dim=1)
+                input_lengths = wavlm_model._get_feat_extract_output_lengths(raw_audio_lengths)
 
-                    gt_mels = mel_spectrogram(unpadded_audio.to(device))
-                    T_gt = gt_mels.size(-1)
-                    T_pred = pred_mels.size(0)
-                    
-                    if T_pred > T_gt:
-                        pred_mels_aligned = pred_mels[:T_gt, :]
-                    else:
-                        pred_mels_aligned = torch.nn.functional.pad(pred_mels, (0, 0, 0, T_gt - T_pred))
-                    
-                    gt_mels_aligned = gt_mels.squeeze(0).transpose(0, 1)
+                ph_target_lengths = (phone_ids_padded != 0).sum(dim=1)
+                # --- Move CTC targets and lengths to the correct device ---
+                phone_ids_padded = phone_ids_padded.to(device)
+                ph_target_lengths = ph_target_lengths.to(device)
+                input_lengths = input_lengths.to(device)
+
+                ph_loss = criterion_ph(ph_log_probs, phone_ids_padded, input_lengths, ph_target_lengths)
+
+                # 2. Masked Reconstruction Loss
+                gt_mels = mel_spectrogram(audios_padded.to(device)).permute(0, 2, 1)
+                T_gt = gt_mels.size(1)
+                T_pred = pred_mels.size(1)
+                if T_pred > T_gt:
+                    pred_mels_aligned = pred_mels[:, :T_gt, :]
+                else:
+                    pred_mels_aligned = F.pad(pred_mels, (0, 0, 0, T_gt - T_pred), 'constant', 0)
+
+                mel_lengths = torch.floor(attention_mask.sum(1) / mel_spectrogram.hop_length).long().to(device)
+                mel_mask = torch.arange(T_gt, device=device)[None, :] < mel_lengths[:, None]
+                mel_mask = mel_mask.unsqueeze(2).expand_as(gt_mels)
+
+                recon_loss_unreduced = criterion_l1(pred_mels_aligned, gt_mels)
+                recon_loss = (recon_loss_unreduced * mel_mask).sum() / mel_mask.sum()
                 
-                    ph_loss = criterion_ph(ph_log_probs_for_ctc, ph_targets, input_lengths, ph_target_lengths)
-                    recon_loss = criterion_l1(pred_mels_aligned, gt_mels_aligned)
-                    
-                    # Val loss excludes speaker classification, as speakers may be unseen
-                    item_loss = config.lambda_ph * ph_loss + config.lambda_recon * recon_loss
-                    
-                    total_val_loss += item_loss.item()
-                    total_val_ph_loss += ph_loss.item()
-                    total_val_recon_loss += recon_loss.item()
-                    num_samples += 1
+                # Val loss excludes speaker classification
+                item_loss = config.lambda_ph * ph_loss + config.lambda_recon * recon_loss
+                
+                running_val_loss += item_loss.item() * audios_padded.size(0)
+                running_val_ph_loss += ph_loss.item() * audios_padded.size(0)
+                running_val_recon_loss += recon_loss.item() * audios_padded.size(0)
+                num_samples += audios_padded.size(0)
+                
+                pbar.set_postfix({'Val Loss': f'{item_loss.item():.4f}'})
 
-                except Exception as e:
-                    logger.warning(f"Skipping val sample {i} in batch {batch_idx} due to error: {e}")
-                    continue
+            except Exception as e:
+                logger.warning(f"Skipping val batch {batch_idx} due to error: {e}")
+                continue
     
-    avg_val_loss = total_val_loss / num_samples if num_samples > 0 else 0
-    avg_ph_loss = total_val_ph_loss / num_samples if num_samples > 0 else 0
-    avg_recon_loss = total_val_recon_loss / num_samples if num_samples > 0 else 0
+    avg_val_loss = running_val_loss / num_samples if num_samples > 0 else 0
+    avg_ph_loss = running_val_ph_loss / num_samples if num_samples > 0 else 0
+    avg_recon_loss = running_val_recon_loss / num_samples if num_samples > 0 else 0
     
     logger.info(f"Epoch VAL: Loss={avg_val_loss:.4f}, Ph={avg_ph_loss:.4f}, Recon={avg_recon_loss:.4f}")
     
@@ -260,7 +270,7 @@ def main():
     parser.add_argument("--save_dir", type=str, default="checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
     parser.add_argument("--subset", type=int, default=500, help="Subset size for training")
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
@@ -410,10 +420,10 @@ def main():
     
     # Setup optimizer and losses
     optimizer = optim.Adam(rcop_model.parameters(), lr=config.lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.5, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.5)
     criterion_ph = nn.CTCLoss(blank=0, zero_infinity=True)  # BLANK token is at index 0
     criterion_sp = nn.CrossEntropyLoss()
-    criterion_l1 = nn.L1Loss()
+    criterion_l1 = nn.L1Loss(reduction='none') # Use 'none' for masked loss calculation
     
     # Resume from checkpoint if specified
     start_epoch = 0

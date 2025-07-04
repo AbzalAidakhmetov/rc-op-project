@@ -160,9 +160,8 @@ class Config:
 
 Key packages:
 - `torch>=2.2`: PyTorch framework
-- `transformers>=4.41`: WavLM model
+- `transformers>=4.41`: WavLM and HiFi-GAN models
 - `resemblyzer`: Speaker embedding extraction
-- `vocoder==0.1.3`: HiFi-GAN vocoder for synthesis
 - `soundfile`: Audio I/O
 - `resampy`: Audio resampling
 

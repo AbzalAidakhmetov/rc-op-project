@@ -42,86 +42,23 @@ def load_audio(file_path, target_sr=16000):
     except Exception as e:
         raise ValueError(f"Failed to load audio from {file_path}: {e}")
 
-def load_model_from_checkpoint(checkpoint_path, num_speakers, num_phones, device):
-    """Load RCOP model from checkpoint."""
-    config = Config()
-    
-    # Load checkpoint first to get metadata
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    # Try to extract num_speakers from checkpoint metadata
-    if 'num_speakers' in checkpoint:
-        num_speakers = checkpoint['num_speakers']
-    elif 'model_state_dict' in checkpoint:
-        # Infer from model state dict if available
-        state_dict = checkpoint['model_state_dict']
-        if 'sp_clf.weight' in state_dict:
-            num_speakers = state_dict['sp_clf.weight'].size(0)
-    
-    # Initialize model
-    model = RCOP(
-        d_spk=config.d_spk,
-        d_ssl=config.d_ssl,
-        n_phones=num_phones,
-        n_spk=num_speakers
-    )
-    
-    # Load checkpoint
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(device)
-    model.eval()
-    
-    return model, num_speakers
-
-def extract_features(audio, wavlm_processor, wavlm_model, voice_encoder, device):
-    """Extract SSL features and speaker embeddings."""
-    
-    # Ensure audio is the right shape and on CPU for processing
-    if audio.dim() == 1:
-        audio_np = audio.numpy()
-    else:
-        audio_np = audio.squeeze().numpy()
-    
-    # Extract SSL features with WavLM
-    inputs = wavlm_processor(audio_np, sampling_rate=16000, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    
+def convert_voice(rcop_model, content_features, ref_spk_embed):
+    """
+    Synthesizes a mel-spectrogram from content features and a reference speaker embedding.
+    This is the final decoding step.
+    """
     with torch.no_grad():
-        ssl_outputs = wavlm_model(**inputs)
-        ssl_features = ssl_outputs.last_hidden_state.squeeze(0)  # (T, d_ssl)
-    
-    # Extract speaker embedding with Resemblyzer
-    with torch.no_grad():
-        # Resemblyzer expects numpy array
-        spk_embed = voice_encoder.embed_utterance(audio_np)
-        spk_embed = torch.from_numpy(spk_embed).float().to(device)  # (d_spk,)
-    
-    return ssl_features, spk_embed
-
-def convert_voice(rcop_model, source_ssl_features, source_spk_embed, ref_spk_embed, device):
-    """Convert voice by removing source speaker and adding reference speaker."""
-    with torch.no_grad():
-        from models.projection import orthogonal_project
-        import torch.nn.functional as F
-
-        # 1. Get the source speaker axis and remove its projection
-        source_axis = rcop_model.W_proj(source_spk_embed)
-        content_features = orthogonal_project(source_ssl_features, source_axis)
+        T = content_features.size(0)
         
-        # 2. Get the reference speaker axis
-        ref_axis = rcop_model.W_proj(ref_spk_embed)
+        # Expand speaker embedding to match time dimension for the decoder
+        spk_embed_expanded = ref_spk_embed.unsqueeze(0).expand(T, -1)
         
-        # 3. Calculate the magnitude of the speaker information in the original signal
-        source_axis_norm = F.normalize(source_axis, dim=-1)
-        alpha = torch.sum(source_ssl_features * source_axis_norm.unsqueeze(0), dim=-1, keepdim=True)
+        # The vocoder head expects both content features and a speaker embedding, concatenated
+        vocoder_input = torch.cat([content_features, spk_embed_expanded], dim=-1)
         
-        # 4. Add this magnitude along the reference speaker's axis
-        ref_axis_norm = F.normalize(ref_axis, dim=-1)
-        converted_features = content_features + alpha * ref_axis_norm.unsqueeze(0)
+        # Predict mel spectrogram
+        pred_mels = rcop_model.vocoder_head(vocoder_input)
         
-        # 5. Project to mel-spectrogram using the trained vocoder head
-        pred_mels = rcop_model.vocoder_head(converted_features)
-
         return pred_mels
 
 def simple_vocoder_synthesis(features, target_length=None):
@@ -189,8 +126,7 @@ def inference(checkpoint_path, source_wav, ref_wav, output_wav, device, logger, 
     voice_encoder.eval()
     
     # The number of speakers is determined by the CHECKPOINT.
-    # Pass a dummy value for num_speakers; it will be overwritten by the checkpoint metadata.
-    rcop_model, num_speakers = load_model_from_checkpoint(checkpoint_path, None, get_num_phones(), device)
+    rcop_model, num_speakers = load_model_from_checkpoint(checkpoint_path, 0, get_num_phones(), device)
     logger.info(f"Loaded model trained on {num_speakers} speakers.")
     
     # Extract features
@@ -198,7 +134,7 @@ def inference(checkpoint_path, source_wav, ref_wav, output_wav, device, logger, 
     source_ssl_features, source_spk_embed = extract_features(
         source_audio, wavlm_processor, wavlm_model, voice_encoder, device
     )
-    ref_ssl_features, ref_spk_embed = extract_features(
+    _, ref_spk_embed = extract_features(
         ref_audio, wavlm_processor, wavlm_model, voice_encoder, device
     )
     
@@ -207,9 +143,27 @@ def inference(checkpoint_path, source_wav, ref_wav, output_wav, device, logger, 
     
     # Perform voice conversion
     logger.info("Performing voice conversion...")
-    pred_mels = convert_voice(
-        rcop_model, source_ssl_features, source_spk_embed, ref_spk_embed, device
-    )
+    
+    with torch.no_grad():
+        # 1. Get the source speaker axis
+        source_axis = rcop_model.W_proj(source_spk_embed)
+        
+        # 2. Get speaker-agnostic content features by projecting the source SSL features
+        content_features = rcop_model.project_orthogonally(source_ssl_features, source_axis)
+        
+        # 3. Get the reference speaker's axis
+        ref_axis = rcop_model.W_proj(ref_spk_embed)
+        
+        # 4. Calculate the magnitude of the speaker information in the original source signal
+        source_axis_norm = torch.nn.functional.normalize(source_axis, dim=-1)
+        alpha = torch.sum(source_ssl_features * source_axis_norm.unsqueeze(0), dim=-1, keepdim=True)
+        
+        # 5. Add this magnitude along the reference speaker's axis to the content features
+        ref_axis_norm = torch.nn.functional.normalize(ref_axis, dim=-1)
+        converted_features = content_features + alpha * ref_axis_norm.unsqueeze(0)
+        
+        # 6. Synthesize mel-spectrogram using the converted features and the reference speaker embedding
+        pred_mels = convert_voice(rcop_model, converted_features, ref_spk_embed)
     
     logger.info(f"Predicted mel-spectrogram shape: {pred_mels.shape}")
     
