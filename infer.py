@@ -10,6 +10,7 @@ setup_environment()
 # -------------------------
 
 import torch
+torch.set_num_threads(1)
 import soundfile as sf
 import numpy as np
 from transformers import WavLMModel, Wav2Vec2FeatureExtractor, SpeechT5HifiGan
@@ -22,6 +23,8 @@ from utils.phonemes import get_num_phones
 from utils.environment import set_seed
 from utils.features import extract_features
 from utils.checkpoint import load_model_from_checkpoint
+
+MODEL_CACHE_DIR = "./models"
 
 def load_audio(file_path, target_sr=16000):
     """Load and preprocess audio file."""
@@ -172,22 +175,23 @@ def inference(checkpoint_path, source_wav, ref_wav, output_wav, device, logger, 
     
     # Load models
     logger.info("Loading models...")
-    config = Config()
     
-    wavlm_processor = Wav2Vec2FeatureExtractor.from_pretrained("microsoft/wavlm-large")
-    wavlm_model = WavLMModel.from_pretrained("microsoft/wavlm-large")
+    wavlm_processor = Wav2Vec2FeatureExtractor.from_pretrained(
+        "microsoft/wavlm-large", cache_dir=MODEL_CACHE_DIR
+    )
+    wavlm_model = WavLMModel.from_pretrained(
+        "microsoft/wavlm-large", cache_dir=MODEL_CACHE_DIR
+    )
     wavlm_model.eval()
     wavlm_model.to(device)
     
     voice_encoder = VoiceEncoder()
     voice_encoder.eval()
     
-    # For inference, we use dummy values for num_speakers and num_phones
-    # In practice, these should match the training setup
-    num_speakers = 100  # Adjust based on your training data
-    num_phones = get_num_phones()
-    
-    rcop_model, num_speakers = load_model_from_checkpoint(checkpoint_path, num_speakers, num_phones, device)
+    # The number of speakers is determined by the CHECKPOINT.
+    # Pass a dummy value for num_speakers; it will be overwritten by the checkpoint metadata.
+    rcop_model, num_speakers = load_model_from_checkpoint(checkpoint_path, None, get_num_phones(), device)
+    logger.info(f"Loaded model trained on {num_speakers} speakers.")
     
     # Extract features
     logger.info("Extracting features...")
@@ -203,41 +207,39 @@ def inference(checkpoint_path, source_wav, ref_wav, output_wav, device, logger, 
     
     # Perform voice conversion
     logger.info("Performing voice conversion...")
-    converted_features = convert_voice(
+    pred_mels = convert_voice(
         rcop_model, source_ssl_features, source_spk_embed, ref_spk_embed, device
     )
     
-    logger.info(f"Converted features shape: {converted_features.shape}")
+    logger.info(f"Predicted mel-spectrogram shape: {pred_mels.shape}")
     
     # Synthesize audio
     if use_vocoder:
         try:
             # Try to use SpeechT5 HiFi-GAN vocoder
             logger.info("Using HiFi-GAN vocoder...")
-            vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan")
+            vocoder = SpeechT5HifiGan.from_pretrained(
+                "microsoft/speecht5_hifigan", cache_dir=MODEL_CACHE_DIR
+            )
             vocoder.to(device)
             vocoder.eval()
             
-            # Convert features to mel-spectrogram format expected by vocoder
-            # This is a simplified conversion - in practice you'd need proper feature processing
             with torch.no_grad():
-                # Project to mel dimensions (80 dims typically)
-                if converted_features.size(-1) != 80:
-                    mel_proj = torch.nn.Linear(converted_features.size(-1), 80).to(device)
-                    mel_features = mel_proj(converted_features)
-                else:
-                    mel_features = converted_features
-                
+                # The model's vocoder_head is trained to output 80-dim mels,
+                # which is what the HiFi-GAN vocoder expects.
+                if pred_mels.size(-1) != 80:
+                    logger.warning(f"Mel-spectrogram dimension is {pred_mels.size(-1)}, but vocoder expects 80. This may lead to poor results.")
+
                 # Generate audio
-                converted_audio = vocoder(mel_features.unsqueeze(0))
+                converted_audio = vocoder(pred_mels.unsqueeze(0))
                 converted_audio = converted_audio.squeeze().cpu()
             
         except Exception as e:
             logger.warning(f"Vocoder failed, using simple synthesis: {e}")
-            converted_audio = simple_vocoder_synthesis(converted_features.cpu(), len(source_audio))
+            converted_audio = simple_vocoder_synthesis(pred_mels.cpu(), len(source_audio))
     else:
         logger.info("Using simple synthesis...")
-        converted_audio = simple_vocoder_synthesis(converted_features.cpu(), len(source_audio))
+        converted_audio = simple_vocoder_synthesis(pred_mels.cpu(), len(source_audio))
     
     # Save output
     logger.info(f"Saving converted audio to {output_wav}")
@@ -249,7 +251,7 @@ def inference(checkpoint_path, source_wav, ref_wav, output_wav, device, logger, 
     return {
         'source_length': len(source_audio),
         'output_length': len(converted_audio),
-        'feature_shape': converted_features.shape
+        'feature_shape': pred_mels.shape
     }
 
 def main():

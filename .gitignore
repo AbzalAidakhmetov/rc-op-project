@@ -179,6 +179,7 @@ dmypy.json
 *.arw
 
 # Large data directories
+models/
 data/txt
 data/wav48_silence_trimmed/
 data/speaker-info.txt

@@ -52,15 +52,21 @@ def test_model_loading():
     """Test that WavLM model can be loaded."""
     print("\nTesting model loading...")
     
+    MODEL_CACHE_DIR = "./models"
+    
     try:
         from transformers import WavLMModel, Wav2Vec2FeatureExtractor
         
         print("Loading WavLM feature extractor...")
-        processor = Wav2Vec2FeatureExtractor.from_pretrained("microsoft/wavlm-large")
+        processor = Wav2Vec2FeatureExtractor.from_pretrained(
+            "microsoft/wavlm-large", cache_dir=MODEL_CACHE_DIR
+        )
         print("✓ WavLM feature extractor loaded successfully")
         
         print("Loading WavLM model...")
-        model = WavLMModel.from_pretrained("microsoft/wavlm-large")
+        model = WavLMModel.from_pretrained(
+            "microsoft/wavlm-large", cache_dir=MODEL_CACHE_DIR
+        )
         print("✓ WavLM model loaded successfully")
         
         return True

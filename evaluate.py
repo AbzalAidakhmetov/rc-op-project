@@ -10,6 +10,7 @@ setup_environment()
 # -------------------------
 
 import torch
+torch.set_num_threads(1)
 import numpy as np
 from torch.utils.data import DataLoader
 from transformers import WavLMModel, Wav2Vec2FeatureExtractor
@@ -24,6 +25,8 @@ from utils.phonemes import get_num_phones
 from utils.environment import set_seed
 from utils.features import extract_features
 from utils.checkpoint import load_model_from_checkpoint
+
+MODEL_CACHE_DIR = "./models"
 
 def evaluate_speaker_classification(model, dataloader, wavlm_processor, wavlm_model, voice_encoder, device, logger):
     """Evaluate speaker classification accuracy."""
@@ -141,8 +144,12 @@ def evaluate_model(checkpoint_path, data_root, device, logger, subset=100, max_d
     logger.info(f"Evaluation dataset: {len(dataset)} samples, {num_speakers_in_dataset} speakers")
     
     # Load models
-    wavlm_processor = Wav2Vec2FeatureExtractor.from_pretrained("microsoft/wavlm-large")
-    wavlm_model = WavLMModel.from_pretrained("microsoft/wavlm-large")
+    wavlm_processor = Wav2Vec2FeatureExtractor.from_pretrained(
+        "microsoft/wavlm-large", cache_dir=MODEL_CACHE_DIR
+    )
+    wavlm_model = WavLMModel.from_pretrained(
+        "microsoft/wavlm-large", cache_dir=MODEL_CACHE_DIR
+    )
     wavlm_model.eval()
     wavlm_model.to(device)
     
