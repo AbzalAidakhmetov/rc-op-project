@@ -32,7 +32,6 @@ from models.rcop import RCOP
 from utils.logging import setup_logger, log_config, log_model_summary
 from utils.phonemes import get_num_phones, text_to_phones, phones_to_ids
 from utils.environment import set_seed
-from utils.features import extract_features
 from utils.checkpoint import save_checkpoint, load_model_from_checkpoint
 
 MODEL_CACHE_DIR = "./models"
@@ -101,8 +100,14 @@ def train_epoch(model, dataloader, optimizer, criterion_ph, criterion_sp, criter
             if spk_embeds.size(0) != audios_padded.size(0):
                 continue
 
+            # --- Ground truth mel-spectrogram for loss calculation ---
+            gt_mels = mel_spectrogram(audios_padded.to(device)) # (N, n_mels, T_mel)
+            gt_mels = gt_mels.permute(0, 2, 1) # (N, T_mel, n_mels)
+
             # --- Forward pass ---
-            ph_logits, sp_logits, pred_mels = model(ssl_features, spk_embeds, lambd)
+            ph_logits, sp_logits, pred_mels = model(
+                ssl_features, spk_embeds, lambd, target_mel_len=gt_mels.size(1)
+            )
 
             # --- Loss Calculation ---
             # 1. Phoneme CTC Loss
@@ -124,21 +129,11 @@ def train_epoch(model, dataloader, optimizer, criterion_ph, criterion_sp, criter
             sp_loss = criterion_sp(sp_logits, spk_ids.to(device))
 
             # 3. Masked Reconstruction Loss
-            gt_mels = mel_spectrogram(audios_padded.to(device)) # (N, n_mels, T_mel)
-            gt_mels = gt_mels.permute(0, 2, 1) # (N, T_mel, n_mels)
-
-            T_gt = gt_mels.size(1)
-            T_pred = pred_mels.size(1)
-            if T_pred > T_gt:
-                pred_mels_aligned = pred_mels[:, :T_gt, :]
-            else:
-                pred_mels_aligned = F.pad(pred_mels, (0, 0, 0, T_gt - T_pred), 'constant', 0)
-
             mel_lengths = torch.floor(attention_mask.sum(1) / mel_spectrogram.hop_length).long().to(device)
-            mel_mask = torch.arange(T_gt, device=device)[None, :] < mel_lengths[:, None]
+            mel_mask = torch.arange(gt_mels.size(1), device=device)[None, :] < mel_lengths[:, None]
             mel_mask = mel_mask.unsqueeze(2).expand_as(gt_mels)
             
-            recon_loss_unreduced = criterion_l1(pred_mels_aligned, gt_mels)
+            recon_loss_unreduced = criterion_l1(pred_mels, gt_mels)
             recon_loss = (recon_loss_unreduced * mel_mask).sum() / mel_mask.sum()
 
             # --- Total Loss & Backward Pass ---
@@ -207,8 +202,13 @@ def validate_epoch(model, dataloader, criterion_ph, criterion_l1, device, logger
                 if spk_embeds.size(0) != audios_padded.size(0):
                     continue
 
+                # --- Ground truth mel-spectrogram ---
+                gt_mels = mel_spectrogram(audios_padded.to(device)).permute(0, 2, 1)
+
                 # --- Forward pass (no GRL) ---
-                ph_logits, _, pred_mels = model(ssl_features, spk_embeds, lambd=0.0)
+                ph_logits, _, pred_mels = model(
+                    ssl_features, spk_embeds, lambd=0.0, target_mel_len=gt_mels.size(1)
+                )
 
                 # --- Loss Calculation ---
                 # 1. Phoneme CTC Loss
@@ -227,19 +227,11 @@ def validate_epoch(model, dataloader, criterion_ph, criterion_l1, device, logger
                 ph_loss = criterion_ph(ph_log_probs, phone_ids_padded, input_lengths, ph_target_lengths)
 
                 # 2. Masked Reconstruction Loss
-                gt_mels = mel_spectrogram(audios_padded.to(device)).permute(0, 2, 1)
-                T_gt = gt_mels.size(1)
-                T_pred = pred_mels.size(1)
-                if T_pred > T_gt:
-                    pred_mels_aligned = pred_mels[:, :T_gt, :]
-                else:
-                    pred_mels_aligned = F.pad(pred_mels, (0, 0, 0, T_gt - T_pred), 'constant', 0)
-
                 mel_lengths = torch.floor(attention_mask.sum(1) / mel_spectrogram.hop_length).long().to(device)
-                mel_mask = torch.arange(T_gt, device=device)[None, :] < mel_lengths[:, None]
+                mel_mask = torch.arange(gt_mels.size(1), device=device)[None, :] < mel_lengths[:, None]
                 mel_mask = mel_mask.unsqueeze(2).expand_as(gt_mels)
 
-                recon_loss_unreduced = criterion_l1(pred_mels_aligned, gt_mels)
+                recon_loss_unreduced = criterion_l1(pred_mels, gt_mels)
                 recon_loss = (recon_loss_unreduced * mel_mask).sum() / mel_mask.sum()
                 
                 # Val loss excludes speaker classification
@@ -282,6 +274,7 @@ def main():
     parser.add_argument("--lambda_ph", type=float, default=None, help="Weight for phoneme loss")
     parser.add_argument("--lambda_sp", type=float, default=None, help="Weight for speaker loss")
     parser.add_argument("--lambda_recon", type=float, default=None, help="Weight for reconstruction loss")
+    parser.add_argument("--n_res_blocks", type=int, default=None, help="Number of residual blocks in vocoder head")
     parser.add_argument("--wandb_project", type=str, default="rc-op-project", help="Weights & Biases project name")
     parser.add_argument("--wandb_entity", type=str, default=None, help="Weights & Biases entity (username or team)")
     parser.add_argument("--wandb_run_name", type=str, default=None, help="A specific name for the W&B run")
@@ -308,6 +301,7 @@ def main():
     if args.lambda_ph is not None: config.lambda_ph = args.lambda_ph
     if args.lambda_sp is not None: config.lambda_sp = args.lambda_sp
     if args.lambda_recon is not None: config.lambda_recon = args.lambda_recon
+    if args.n_res_blocks is not None: config.n_res_blocks = args.n_res_blocks
     
     log_config(logger, config)
     
@@ -409,7 +403,8 @@ def main():
         d_spk=config.d_spk,
         d_ssl=config.d_ssl,
         n_phones=num_phones,
-        n_spk=num_total_speakers
+        n_spk=num_total_speakers,
+        n_res_blocks=config.n_res_blocks
     )
     rcop_model.to(device)
     

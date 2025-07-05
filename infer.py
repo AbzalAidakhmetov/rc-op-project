@@ -145,25 +145,14 @@ def inference(checkpoint_path, source_wav, ref_wav, output_wav, device, logger, 
     logger.info("Performing voice conversion...")
     
     with torch.no_grad():
-        # 1. Get the source speaker axis
-        source_axis = rcop_model.W_proj(source_spk_embed)
-        
-        # 2. Get speaker-agnostic content features by projecting the source SSL features
-        content_features = rcop_model.project_orthogonally(source_ssl_features, source_axis)
-        
-        # 3. Get the reference speaker's axis
-        ref_axis = rcop_model.W_proj(ref_spk_embed)
-        
-        # 4. Calculate the magnitude of the speaker information in the original source signal
-        source_axis_norm = torch.nn.functional.normalize(source_axis, dim=-1)
-        alpha = torch.sum(source_ssl_features * source_axis_norm.unsqueeze(0), dim=-1, keepdim=True)
-        
-        # 5. Add this magnitude along the reference speaker's axis to the content features
-        ref_axis_norm = torch.nn.functional.normalize(ref_axis, dim=-1)
-        converted_features = content_features + alpha * ref_axis_norm.unsqueeze(0)
-        
-        # 6. Synthesize mel-spectrogram using the converted features and the reference speaker embedding
-        pred_mels = convert_voice(rcop_model, converted_features, ref_spk_embed)
+        # The new model forward pass handles the entire conversion.
+        # We don't need the adversarial component for inference, so lambda is 0.
+        _, _, pred_mels = rcop_model(
+            source_ssl_features.unsqueeze(0), 
+            ref_spk_embed.unsqueeze(0), 
+            lambd=0.0
+        )
+        pred_mels = pred_mels.squeeze(0)
     
     logger.info(f"Predicted mel-spectrogram shape: {pred_mels.shape}")
     

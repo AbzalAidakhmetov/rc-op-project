@@ -71,77 +71,7 @@ def evaluate_speaker_classification(model, dataloader, wavlm_processor, wavlm_mo
     logger.info(f"Speaker classification accuracy: {accuracy:.4f} ({correct}/{total})")
     return accuracy
 
-def evaluate_speaker_disentanglement(model, dataloader, wavlm_processor, wavlm_model, voice_encoder, device, logger):
-    """Evaluate how well speaker information is removed from content features."""
-    model.eval()
-    
-    speaker_embeddings = {}
-    content_features = {}
-    
-    with torch.no_grad():
-        for audio, spk_id, wav_path, _, attention_mask in tqdm(dataloader, desc="Extracting features for disentanglement"):
-            # This evaluation assumes a batch size of 1 for simplicity.
-            if audio.size(0) != 1:
-                logger.warning("Disentanglement evaluation should be run with batch size 1. Skipping batch.")
-                continue
-
-            try:
-                unpadded_audio = audio[0, :attention_mask[0].sum()]
-                if unpadded_audio.numel() == 0: continue
-
-                # Extract features
-                ssl_features, spk_embed = extract_features(
-                    unpadded_audio, wavlm_processor, wavlm_model, voice_encoder, device
-                )
-                
-                # Get projected features (content without speaker info)
-                axis = model.W_proj(spk_embed)
-                proj_feats = model.project_orthogonally(ssl_features, axis)
-                
-                # Store mean content features per speaker
-                spk_id_str = str(spk_id.item())
-                if spk_id_str not in content_features:
-                    content_features[spk_id_str] = []
-                    speaker_embeddings[spk_id_str] = []
-                
-                content_features[spk_id_str].append(proj_feats.mean(0).cpu())
-                speaker_embeddings[spk_id_str].append(spk_embed.cpu())
-                
-            except Exception as e:
-                logger.warning(f"Skipping sample due to error: {e}")
-                continue
-    
-    # Calculate average similarity within speakers for content vs speaker embeddings
-    content_similarities = []
-    speaker_similarities = []
-    
-    for spk_id in content_features:
-        if len(content_features[spk_id]) > 1:
-            # Content features should be similar within speaker
-            feats = torch.stack(content_features[spk_id])
-            mean_feat = feats.mean(0)
-            similarities = torch.cosine_similarity(feats, mean_feat.unsqueeze(0))
-            content_similarities.extend(similarities.tolist())
-            
-            # Speaker embeddings should also be similar within speaker
-            embeds = torch.stack(speaker_embeddings[spk_id])
-            mean_embed = embeds.mean(0)
-            similarities = torch.cosine_similarity(embeds, mean_embed.unsqueeze(0))
-            speaker_similarities.extend(similarities.tolist())
-    
-    if not content_similarities or not speaker_similarities:
-        logger.warning("Could not compute similarity scores. This typically requires more than one sample per speaker in the evaluation set.")
-        return 0, 0
-    
-    avg_content_sim = np.mean(content_similarities) if content_similarities else 0
-    avg_speaker_sim = np.mean(speaker_similarities) if speaker_similarities else 0
-    
-    logger.info(f"Average content similarity within speakers: {avg_content_sim:.4f}")
-    logger.info(f"Average speaker embedding similarity within speakers: {avg_speaker_sim:.4f}")
-    
-    return avg_content_sim, avg_speaker_sim
-
-def evaluate_model(checkpoint_path, data_root, device, logger, subset=100, max_duration_s=20):
+def evaluate_model(checkpoint_path, data_root, device, logger, subset=100, max_duration_s=20, batch_size=1):
     """Comprehensive model evaluation."""
     logger.info(f"Evaluating model from {checkpoint_path}")
     
@@ -155,7 +85,7 @@ def evaluate_model(checkpoint_path, data_root, device, logger, subset=100, max_d
     )
     dataloader, dataset = create_dataloader(
         args=vctk_args,
-        batch_size=1, # Use batch size 1 for evaluation for simplicity
+        batch_size=batch_size, # Use batch size from args for evaluation
         shuffle=False,
     )
     
@@ -186,24 +116,15 @@ def evaluate_model(checkpoint_path, data_root, device, logger, subset=100, max_d
         rcop_model, dataloader, wavlm_processor, wavlm_model, voice_encoder, device, logger
     )
     
-    # Evaluate speaker disentanglement
-    content_sim, speaker_sim = evaluate_speaker_disentanglement(
-        rcop_model, dataloader, wavlm_processor, wavlm_model, voice_encoder, device, logger
-    )
-    
     # Summary
     logger.info("=" * 50)
     logger.info("EVALUATION SUMMARY")
     logger.info("=" * 50)
     logger.info(f"Speaker classification accuracy: {speaker_acc:.4f}")
-    logger.info(f"Content feature consistency: {content_sim:.4f}")
-    logger.info(f"Speaker embedding consistency: {speaker_sim:.4f}")
     logger.info("=" * 50)
     
     return {
         'speaker_accuracy': speaker_acc,
-        'content_similarity': content_sim,
-        'speaker_similarity': speaker_sim
     }
 
 def main():
@@ -231,7 +152,7 @@ def main():
     logger.info(f"Using random seed: {Config().seed}")
     
     # Evaluate model
-    results = evaluate_model(args.ckpt, args.data_root, device, logger, args.subset, args.max_duration)
+    results = evaluate_model(args.ckpt, args.data_root, device, logger, args.subset, args.max_duration, args.batch_size)
     
     logger.info("Evaluation completed!")
 

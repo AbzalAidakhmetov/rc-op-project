@@ -55,7 +55,7 @@ def main():
     
     # Check if transformers is available
     try:
-        from transformers import WavLMModel, Wav2Vec2Processor
+        from transformers import WavLMModel, Wav2Vec2FeatureExtractor
     except ImportError:
         print("Transformers not available yet. Models will be downloaded automatically when first used.")
         return 0
@@ -64,7 +64,7 @@ def main():
     wavlm_model = download_model_with_retry(
         "microsoft/wavlm-large", 
         WavLMModel, 
-        Wav2Vec2Processor
+        Wav2Vec2FeatureExtractor
     )
     
     if wavlm_model is not None:

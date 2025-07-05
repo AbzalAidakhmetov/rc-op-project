@@ -1,20 +1,68 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import List
 from .grad_reverse import grad_reverse
 from .projection   import orthogonal_project
 
-class ResidualBlock(nn.Module):
-    def __init__(self, d_model):
+class ConvNeXtBlock(nn.Module):
+    """A simplified ConvNeXt-style block for 1D sequences."""
+    def __init__(self, d_model, kernel_size=7, expand_ratio=2):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.Linear(d_model, d_model)
+        self.dw_conv = nn.Conv1d(
+            d_model, d_model, kernel_size=kernel_size,
+            groups=d_model, padding="same"
         )
-    
+        self.norm = nn.LayerNorm(d_model)
+        self.pw_conv1 = nn.Linear(d_model, d_model * expand_ratio)
+        self.act = nn.GELU()
+        self.pw_conv2 = nn.Linear(d_model * expand_ratio, d_model)
+
     def forward(self, x):
-        return x + self.block(x)
+        # Input x has shape (N, T, C)
+        residual = x
+        x = x.permute(0, 2, 1) # (N, C, T)
+        x = self.dw_conv(x)
+        x = x.permute(0, 2, 1) # (N, T, C)
+        x = self.norm(x)
+        x = self.pw_conv1(x)
+        x = self.act(x)
+        x = self.pw_conv2(x)
+        return residual + x
+
+class VocoderHead(nn.Module):
+    """
+    A more sophisticated vocoder head that converts SSL features to mel-spectrograms.
+    It handles the time dimension upsampling from SSL feature rate to mel-spectrogram rate.
+    """
+    def __init__(self, input_dim, output_dim, hidden_dim, n_blocks, upsample_factor):
+        super().__init__()
+        self.upsample_factor = upsample_factor
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        
+        self.blocks = nn.ModuleList([
+            ConvNeXtBlock(hidden_dim) for _ in range(n_blocks)
+        ])
+        
+        self.output_proj = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x, target_len=None):
+        # x: (N, T_in, C_in)
+        x = self.input_proj(x) # (N, T_in, H)
+
+        # Upsample time dimension
+        x = x.permute(0, 2, 1) # (N, H, T_in)
+        if target_len:
+             x = F.interpolate(x, size=target_len, mode='linear', align_corners=False)
+        else:
+             x = F.interpolate(x, scale_factor=self.upsample_factor, mode='linear', align_corners=False)
+        x = x.permute(0, 2, 1) # (N, T_out, H)
+
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.output_proj(x) # (N, T_out, C_out)
+        return x
 
 class RCOP(nn.Module):
     def __init__(self, d_spk, d_ssl, n_phones, n_spk, n_mels=80, n_res_blocks=3):
@@ -23,50 +71,37 @@ class RCOP(nn.Module):
         self.ph_clf       = nn.Linear(d_ssl, n_phones)
         self.sp_clf       = nn.Linear(d_ssl, n_spk)
         
-        # Decoder with residual blocks for improved gradient flow
-        # The decoder now receives both content features and speaker information
-        decoder_input_dim = d_ssl + d_spk
-        decoder_layers: List[nn.Module] = [nn.Linear(decoder_input_dim, d_ssl)]
-        for _ in range(n_res_blocks):
-            decoder_layers.append(ResidualBlock(d_ssl))
-        decoder_layers.append(nn.Linear(d_ssl, n_mels))
-        
-        self.vocoder_head = nn.Sequential(*decoder_layers)
+        # More sophisticated vocoder head
+        # WavLM features are at 50Hz (stride 320), Mels are at ~62.5Hz (hop 256)
+        # Upsampling factor is target_sr / hop_length / 50 = 16000 / 256 / 50 = 1.25
+        self.vocoder_head = VocoderHead(
+            input_dim=d_ssl,
+            output_dim=n_mels,
+            hidden_dim=d_ssl, # internal dimension
+            n_blocks=n_res_blocks,
+            upsample_factor=1.25 
+        )
 
     def project_orthogonally(self, features, axis):
         """Helper method to call the projection function."""
         return orthogonal_project(features, axis)
 
-    def forward(self, ssl_frames, spk_embed, lambd=1.):
-        # ssl_frames: (N, T, d_ssl) or (T, d_ssl)
-        # spk_embed: (N, d_spk) or (d_spk)
-        is_batch = ssl_frames.dim() == 3
-
-        axis       = self.W_proj(spk_embed)                 # (N, d_ssl) or (d_ssl)
-        proj_feats = self.project_orthogonally(ssl_frames, axis)   # (N, T, d_ssl) or (T, d_ssl)
-
-        ph_logits  = self.ph_clf(proj_feats)                # (N, T, n_phones) or (T, n_phones)
-
-        # Expand speaker embedding to match time dimension for vocoder
-        if is_batch:
-            T = proj_feats.size(1)
-            spk_embed_expanded = spk_embed.unsqueeze(1).expand(-1, T, -1) # (N, T, d_spk)
-        else:
-            T = proj_feats.size(0)
-            spk_embed_expanded = spk_embed.unsqueeze(0).expand(T, -1) # (T, d_spk)
-
-        # Concatenate content and speaker info for reconstruction
-        vocoder_input = torch.cat([proj_feats, spk_embed_expanded], dim=-1)
-        pred_mels = self.vocoder_head(vocoder_input)           # (N, T, n_mels) or (T, n_mels)
-
-        # Adversarial speaker classification is now frame-wise for robustness
-        rev_feats   = grad_reverse(proj_feats, lambd)       # (N, T, d_ssl) or (T, d_ssl)
-        sp_logits_per_frame = self.sp_clf(rev_feats)        # (N, T, n_spk) or (T, n_spk)
+    def forward(self, ssl_features, spk_embed, lambd=0.0, target_mel_len=None):
+        # 1. Learn speaker projection axis
+        spk_axis = self.W_proj(spk_embed)
         
-        # Average over time dimension to get a single prediction per utterance
-        if is_batch:
-            sp_logits = sp_logits_per_frame.mean(dim=1) # (N, n_spk)
-        else:
-            sp_logits = sp_logits_per_frame.mean(dim=0, keepdim=True) # (1, n_spk)
-
+        # 2. Project to get speaker-agnostic content features
+        proj_feats = self.project_orthogonally(ssl_features, spk_axis)
+        
+        # 3. Phoneme classification on content features
+        ph_logits = self.ph_clf(proj_feats)
+        
+        # 4. Adversarial speaker classification on content features
+        rev_feats = grad_reverse(proj_feats, lambd)
+        sp_logits_frame = self.sp_clf(rev_feats)
+        sp_logits = sp_logits_frame.mean(dim=1)
+        
+        # 5. Reconstruct mel-spectrogram
+        pred_mels = self.vocoder_head(proj_feats, target_len=target_mel_len)
+        
         return ph_logits, sp_logits, pred_mels 

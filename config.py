@@ -15,6 +15,7 @@ class Config:
     # model dims
     d_ssl: int = 1024                      # WavLM-Large hidden size
     d_spk: int = 256                       # Resemblyzer size
+    n_res_blocks: int = 3                  # Num residual blocks in vocoder head
 
     # training
     epochs:        int     = 20
@@ -24,4 +25,4 @@ class Config:
     # loss weights
     lambda_ph:     float   = 1.0
     lambda_sp:     float   = 1.0
-    lambda_recon:  float   = 2.5 
+    lambda_recon:  float   = 1.0 

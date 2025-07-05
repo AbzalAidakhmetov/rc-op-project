@@ -171,7 +171,7 @@ Logs      : ./logs
 Next steps
 ──────────
 1)  conda activate $ENV_NAME
-2)  export VCTK_ROOT=\${PWD}/${DATA_DIR}/VCTK-Corpus-0.92
+2)  export VCTK_ROOT=\${PWD}/${DATA_DIR}
 3)  python train.py --data_root \$VCTK_ROOT --epochs 20
 
 Happy training!
