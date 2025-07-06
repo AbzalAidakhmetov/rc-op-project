@@ -1,107 +1,108 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List
-from .grad_reverse import grad_reverse
-from .projection   import orthogonal_project
+from .grad_reverse import GradientReversal
+from .projection import OrthogonalProjection
+from .decoder import CustomDecoder
+from .hires_features import HiResFeatureExtractor
+from utils.upsample import LearnedUpsample
 
-class ConvNeXtBlock(nn.Module):
-    """A simplified ConvNeXt-style block for 1D sequences."""
-    def __init__(self, d_model, kernel_size=7, expand_ratio=2):
-        super().__init__()
-        self.dw_conv = nn.Conv1d(
-            d_model, d_model, kernel_size=kernel_size,
-            groups=d_model, padding="same"
-        )
-        self.norm = nn.LayerNorm(d_model)
-        self.pw_conv1 = nn.Linear(d_model, d_model * expand_ratio)
-        self.act = nn.GELU()
-        self.pw_conv2 = nn.Linear(d_model * expand_ratio, d_model)
-
-    def forward(self, x):
-        # Input x has shape (N, T, C)
-        residual = x
-        x = x.permute(0, 2, 1) # (N, C, T)
-        x = self.dw_conv(x)
-        x = x.permute(0, 2, 1) # (N, T, C)
-        x = self.norm(x)
-        x = self.pw_conv1(x)
-        x = self.act(x)
-        x = self.pw_conv2(x)
-        return residual + x
-
-class VocoderHead(nn.Module):
-    """
-    A more sophisticated vocoder head that converts SSL features to mel-spectrograms.
-    It handles the time dimension upsampling from SSL feature rate to mel-spectrogram rate.
-    """
-    def __init__(self, input_dim, output_dim, hidden_dim, n_blocks, upsample_factor):
-        super().__init__()
-        self.upsample_factor = upsample_factor
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
-        
-        self.blocks = nn.ModuleList([
-            ConvNeXtBlock(hidden_dim) for _ in range(n_blocks)
-        ])
-        
-        self.output_proj = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x, target_len=None):
-        # x: (N, T_in, C_in)
-        x = self.input_proj(x) # (N, T_in, H)
-
-        # Upsample time dimension
-        x = x.permute(0, 2, 1) # (N, H, T_in)
-        if target_len:
-             x = F.interpolate(x, size=target_len, mode='linear', align_corners=False)
-        else:
-             x = F.interpolate(x, scale_factor=self.upsample_factor, mode='linear', align_corners=False)
-        x = x.permute(0, 2, 1) # (N, T_out, H)
-
-        for block in self.blocks:
-            x = block(x)
-
-        x = self.output_proj(x) # (N, T_out, C_out)
-        return x
+HIRES_DIM = 64 # Dimension for the high-resolution feature stream
 
 class RCOP(nn.Module):
-    def __init__(self, d_spk, d_ssl, n_phones, n_spk, n_mels=80, n_res_blocks=3):
+    """
+    Reference-Conditioned Orthogonal Projection (RC-OP) for Voice Conversion.
+    This model disentangles speaker and content information from speech.
+    """
+    def __init__(self, d_spk, d_ssl, n_phones, n_spk, n_mels: int = 80, hop_length: int = 256):
         super().__init__()
-        self.W_proj       = nn.Linear(d_spk, d_ssl, bias=False)  # learns speaker axis
-        self.ph_clf       = nn.Linear(d_ssl, n_phones)
-        self.sp_clf       = nn.Linear(d_ssl, n_spk)
+        self.d_spk = d_spk
+        self.d_ssl = d_ssl
+
+        # 1. Speaker axis projection: Learns to map a speaker embedding to a D-dimensional axis.
+        self.spk_proj = nn.Linear(d_spk, d_ssl)
         
-        # More sophisticated vocoder head
-        # WavLM features are at 50Hz (stride 320), Mels are at ~62.5Hz (hop 256)
-        # Upsampling factor is target_sr / hop_length / 50 = 16000 / 256 / 50 = 1.25
-        self.vocoder_head = VocoderHead(
-            input_dim=d_ssl,
-            output_dim=n_mels,
-            hidden_dim=d_ssl, # internal dimension
-            n_blocks=n_res_blocks,
-            upsample_factor=1.25 
+        # 2. Orthogonal projection module.
+        self.ortho_proj = OrthogonalProjection()
+
+        # 3. Phoneme classifier: Predicts phonemes from the content-only features.
+        #    We use a small MLP instead of a single linear layer to give the model
+        #    more capacity to learn the complex mapping from features to phonemes.
+        classifier_hidden_dim = d_ssl // 2
+        self.ph_clf = nn.Sequential(
+            nn.Linear(d_ssl, classifier_hidden_dim),
+            nn.GELU(),
+            nn.LayerNorm(classifier_hidden_dim),
+            nn.Linear(classifier_hidden_dim, n_phones)
         )
 
-    def project_orthogonally(self, features, axis):
-        """Helper method to call the projection function."""
-        return orthogonal_project(features, axis)
+        # 4. Speaker classifier: Adversarially trained to predict the speaker from content features.
+        # The Gradient Reversal Layer ensures the main model learns to produce features
+        # from which the speaker *cannot* be identified.
+        self.spk_grl = GradientReversal()
+        self.spk_clf = nn.Linear(d_ssl, n_spk)
+        
+        # 5. High-resolution feature extractor
+        self.hires_net = HiResFeatureExtractor(output_dim=HIRES_DIM, upsample_factor=hop_length)
 
-    def forward(self, ssl_features, spk_embed, lambd=0.0, target_mel_len=None):
-        # 1. Learn speaker projection axis
-        spk_axis = self.W_proj(spk_embed)
+        # 6. Custom decoder: Synthesizes a mel-spectrogram from the combined
+        #    content features, high-resolution features, and a target speaker embedding.
+        self.vocoder_head = CustomDecoder(d_ssl=d_ssl + HIRES_DIM, d_spk=d_spk, n_mels=n_mels)
+
+        # Learned up-sampler: 50 Hz → 62.5 Hz (factor 1.25)
+        # This will now operate on the high-dimensional features before the decoder.
+        self.upsample = LearnedUpsample(d_ssl)
+
+    def forward(self, ssl_features, spk_embed, raw_audio, lambd=1.0, bypass_projection=False):
+        """
+        Args:
+            ssl_features (torch.Tensor): SSL features from WavLM, shape (N, T_ssl, D_ssl)
+            spk_embed (torch.Tensor): Speaker embedding, shape (N, D_spk)
+            raw_audio (torch.Tensor): Raw audio waveform for the hires stream, shape (N, T_audio)
+            lambd (float): Lambda for the Gradient Reversal Layer.
+            bypass_projection (bool): If True, bypass the orthogonal projection for debugging.
         
-        # 2. Project to get speaker-agnostic content features
-        proj_feats = self.project_orthogonally(ssl_features, spk_axis)
+        Returns:
+            ph_logits (torch.Tensor): Phoneme predictions, shape (N, T_ssl, n_phones)
+            sp_logits_agg (torch.Tensor): Aggregated speaker predictions, shape (N, n_spk)
+            pred_mels (torch.Tensor): Predicted mel-spectrogram, shape (N, T_mel, n_mels)
+        """
+        # 1. Project speaker embedding to get the speaker's characteristic axis in the feature space.
+        spk_axis = self.spk_proj(spk_embed)
+
+        if bypass_projection:
+            # For debugging reconstruction, bypass the projection to see if the model can overfit.
+            content_features = ssl_features
+        else:
+            # 2. Orthogonally project the SSL features to remove the speaker component,
+            #    leaving only the content component.
+            content_features = self.ortho_proj(ssl_features, spk_axis)
         
-        # 3. Phoneme classification on content features
-        ph_logits = self.ph_clf(proj_feats)
+        # 3. Predict phonemes from the ORIGINAL SSL features.
+        ph_logits = self.ph_clf(ssl_features)
         
-        # 4. Adversarial speaker classification on content features
-        rev_feats = grad_reverse(proj_feats, lambd)
-        sp_logits_frame = self.sp_clf(rev_feats)
-        sp_logits = sp_logits_frame.mean(dim=1)
+        # 4. Adversarially predict the speaker from the purified content features.
+        reversed_content = self.spk_grl(content_features, lambd)
+        sp_logits = self.spk_clf(reversed_content)
         
-        # 5. Reconstruct mel-spectrogram
-        pred_mels = self.vocoder_head(proj_feats, target_len=target_mel_len)
+        # Aggregate speaker logits over the time dimension for a single classification per utterance.
+        sp_logits_agg = sp_logits.mean(dim=1)
+
+        # 5. Upsample the low-resolution content features.
+        upsampled_content_features = self.upsample(content_features)
         
-        return ph_logits, sp_logits, pred_mels 
+        # 6. Extract high-resolution features from the raw audio.
+        hires_features = self.hires_net(raw_audio)
+
+        # Align temporal dimensions before concatenation
+        target_len = min(upsampled_content_features.size(1), hires_features.size(1))
+        upsampled_content_features = upsampled_content_features[:, :target_len, :]
+        hires_features = hires_features[:, :target_len, :]
+        
+        # 7. Combine the feature streams
+        combined_content_features = torch.cat([upsampled_content_features, hires_features], dim=-1)
+
+        # 8. Synthesize a mel-spectrogram from the combined features
+        pred_mels = self.vocoder_head(combined_content_features, spk_embed)
+        
+        return ph_logits, sp_logits_agg, pred_mels

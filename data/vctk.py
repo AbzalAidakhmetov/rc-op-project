@@ -168,12 +168,17 @@ def collate_fn(batch):
     """Custom collate function to handle variable length audio."""
     audios, spk_ids, wav_paths, phone_id_lists = zip(*batch)
     
-    # Pad audio and phoneme sequences
+    # Pad sequences
     audios_padded = pad_sequence(list(audios), batch_first=True, padding_value=0)
     phone_ids_padded = pad_sequence([torch.tensor(p) for p in phone_id_lists], batch_first=True, padding_value=0)
-    
-    # Create attention mask for the audio
-    attention_mask = (audios_padded != 0).long()
+
+    # True lengths (number of valid samples) per audio
+    lengths = torch.tensor([a.size(0) for a in audios], dtype=torch.long)
+
+    # Create boolean mask based on lengths: (B, T)
+    max_len = audios_padded.size(1)
+    attention_mask = torch.arange(max_len).unsqueeze(0) < lengths.unsqueeze(1)
+    attention_mask = attention_mask.long()
     
     return audios_padded, torch.tensor(spk_ids), wav_paths, phone_ids_padded, attention_mask
 

@@ -284,3 +284,6 @@ dvc.lock
 # *.pkl
 # *.pth
 # *.ckpt 
+
+# Test scripts
+test_setup.py 

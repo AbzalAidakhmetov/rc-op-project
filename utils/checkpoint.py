@@ -4,9 +4,6 @@ from models.rcop import RCOP
 
 def load_model_from_checkpoint(checkpoint_path, num_speakers, num_phones, device):
     """Load RCOP model from checkpoint."""
-    config = Config()
-    
-    # Load checkpoint first to get metadata
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
     # Try to extract num_speakers and num_phones from checkpoint metadata
@@ -18,18 +15,20 @@ def load_model_from_checkpoint(checkpoint_path, num_speakers, num_phones, device
     # Infer from model state dict if available (fallback)
     if num_speakers is None and 'model_state_dict' in checkpoint:
         state_dict = checkpoint['model_state_dict']
-        if 'sp_clf.weight' in state_dict:
-            num_speakers = state_dict['sp_clf.weight'].size(0)
+        if 'spk_clf.weight' in state_dict:
+            num_speakers = state_dict['spk_clf.weight'].size(0)
     
     if num_speakers is None or num_phones is None:
         raise ValueError("Could not determine num_speakers or num_phones from checkpoint.")
 
     # Initialize model
+    config = Config()
     model = RCOP(
         d_spk=config.d_spk,
         d_ssl=config.d_ssl,
         n_phones=num_phones,
-        n_spk=num_speakers
+        n_spk=num_speakers,
+        hop_length=config.hop_length
     )
     
     # Load checkpoint

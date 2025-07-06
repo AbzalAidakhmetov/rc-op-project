@@ -13,8 +13,10 @@ import torch
 torch.set_num_threads(1)
 import soundfile as sf
 import numpy as np
-from transformers import WavLMModel, Wav2Vec2FeatureExtractor, SpeechT5HifiGan
-from resemblyzer import VoiceEncoder
+from transformers import WavLMModel, Wav2Vec2FeatureExtractor, SpeechT5HifiGan, AutoFeatureExtractor, AutoModel
+from speechbrain.inference import EncoderClassifier
+import torchaudio.transforms as T
+import librosa
 
 from config import Config
 from models.rcop import RCOP
@@ -42,61 +44,50 @@ def load_audio(file_path, target_sr=16000):
     except Exception as e:
         raise ValueError(f"Failed to load audio from {file_path}: {e}")
 
-def convert_voice(rcop_model, content_features, ref_spk_embed):
+def griffin_lim_synthesis(mel_spectrogram, config, target_length=None):
     """
-    Synthesizes a mel-spectrogram from content features and a reference speaker embedding.
-    This is the final decoding step.
+    Synthesize audio from a mel-spectrogram using the Griffin-Lim algorithm.
+    This serves as a proper, functional placeholder for a neural vocoder.
     """
-    with torch.no_grad():
-        T = content_features.size(0)
-        
-        # Expand speaker embedding to match time dimension for the decoder
-        spk_embed_expanded = ref_spk_embed.unsqueeze(0).expand(T, -1)
-        
-        # The vocoder head expects both content features and a speaker embedding, concatenated
-        vocoder_input = torch.cat([content_features, spk_embed_expanded], dim=-1)
-        
-        # Predict mel spectrogram
-        pred_mels = rcop_model.vocoder_head(vocoder_input)
-        
-        return pred_mels
+    # Inverse Mel-scale transformation
+    inverse_mel_scaler = T.InverseMelScale(
+        n_stft=config.n_fft // 2 + 1,
+        n_mels=config.n_mels,
+        sample_rate=config.target_sr,
+        f_min=config.f_min,
+        f_max=config.f_max,
+    )
+    
+    # The model predicts mel-spectrograms on a natural log scale.
+    # Griffin-Lim requires linear magnitude, so we exponentiate.
+    linear_spectrogram = torch.exp(mel_spectrogram)
+    
+    # Invert mel scale to get linear frequency spectrogram
+    linear_spectrogram = inverse_mel_scaler(linear_spectrogram.T).T
 
-def simple_vocoder_synthesis(features, target_length=None):
-    """Simple placeholder vocoder - converts features back to audio."""
-    # This is a very simplified vocoder implementation
-    # In practice, you'd use a proper vocoder like HiFi-GAN
+    # Convert to numpy for librosa
+    spec_np = linear_spectrogram.cpu().numpy()
     
-    # Simple approach: use the mean of features as a "harmonic profile"
-    # and generate audio through basic synthesis
+    # Griffin-Lim algorithm
+    audio = librosa.griffinlim(
+        spec_np,
+        n_iter=32, # Number of iterations for phase recovery
+        hop_length=config.hop_length,
+        win_length=config.win_length
+    )
     
-    if target_length is None:
-        target_length = features.size(0) * 320  # Rough frame-to-sample ratio
-    
-    # Use a subset of features as harmonic content
-    harmonic_content = features[:, :64].mean(dim=1)  # (T,)
-    
-    # Generate simple audio by repeating and modulating the harmonic content
-    samples_per_frame = target_length // features.size(0)
-    audio = []
-    
-    for i, harm in enumerate(harmonic_content):
-        # Simple sine wave generation based on feature values
-        t = torch.linspace(0, 2 * np.pi, samples_per_frame)
-        freq = 100 + torch.clamp(harm * 200, 0, 400)  # Map to reasonable freq range
-        frame_audio = 0.1 * torch.sin(freq * t)
-        audio.append(frame_audio)
-    
-    audio = torch.cat(audio)
-    
+    audio = torch.from_numpy(audio)
+
     # Ensure correct length
-    if len(audio) > target_length:
-        audio = audio[:target_length]
-    elif len(audio) < target_length:
-        audio = torch.nn.functional.pad(audio, (0, target_length - len(audio)))
+    if target_length is not None:
+        if len(audio) > target_length:
+            audio = audio[:target_length]
+        elif len(audio) < target_length:
+            audio = torch.nn.functional.pad(audio, (0, target_length - len(audio)))
     
     return audio
 
-def inference(checkpoint_path, source_wav, ref_wav, output_wav, device, logger, use_vocoder=True):
+def inference(checkpoint_path, source_wav, ref_wav, output_wav, device, logger, use_vocoder=True, no_speaker_fusion=False):
     """Perform voice conversion inference."""
     
     logger.info(f"Loading audio files...")
@@ -110,6 +101,9 @@ def inference(checkpoint_path, source_wav, ref_wav, output_wav, device, logger, 
     logger.info(f"Source audio length: {len(source_audio) / 16000:.2f}s")
     logger.info(f"Reference audio length: {len(ref_audio) / 16000:.2f}s")
     
+    # Load config for synthesis parameters
+    config = Config()
+
     # Load models
     logger.info("Loading models...")
     
@@ -122,8 +116,15 @@ def inference(checkpoint_path, source_wav, ref_wav, output_wav, device, logger, 
     wavlm_model.eval()
     wavlm_model.to(device)
     
-    voice_encoder = VoiceEncoder()
-    voice_encoder.eval()
+    speaker_model = EncoderClassifier.from_hparams(
+        source="speechbrain/spkrec-ecapa-voxceleb",
+        savedir=os.path.join(MODEL_CACHE_DIR, "spkrec-ecapa-voxceleb"),
+        run_opts={"device": device}
+    )
+    if not speaker_model:
+        logger.error("Fatal: SpeechBrain speaker model failed to load.")
+        raise RuntimeError("Could not load SpeechBrain speaker model.")
+    speaker_model.eval()
     
     # The number of speakers is determined by the CHECKPOINT.
     rcop_model, num_speakers = load_model_from_checkpoint(checkpoint_path, 0, get_num_phones(), device)
@@ -132,11 +133,16 @@ def inference(checkpoint_path, source_wav, ref_wav, output_wav, device, logger, 
     # Extract features
     logger.info("Extracting features...")
     source_ssl_features, source_spk_embed = extract_features(
-        source_audio, wavlm_processor, wavlm_model, voice_encoder, device
+        source_audio, wavlm_processor, wavlm_model, speaker_model, device
     )
     _, ref_spk_embed = extract_features(
-        ref_audio, wavlm_processor, wavlm_model, voice_encoder, device
+        ref_audio, wavlm_processor, wavlm_model, speaker_model, device
     )
+    
+    if no_speaker_fusion:
+        logger.warning("--- SPEAKER FUSION DISABLED ---")
+        logger.warning("Generating audio from content features with a ZERO speaker embedding.")
+        ref_spk_embed = torch.zeros_like(ref_spk_embed)
     
     logger.info(f"Source SSL features shape: {source_ssl_features.shape}")
     logger.info(f"Reference speaker embedding shape: {ref_spk_embed.shape}")
@@ -149,12 +155,24 @@ def inference(checkpoint_path, source_wav, ref_wav, output_wav, device, logger, 
         # We don't need the adversarial component for inference, so lambda is 0.
         _, _, pred_mels = rcop_model(
             source_ssl_features.unsqueeze(0), 
-            ref_spk_embed.unsqueeze(0), 
+            ref_spk_embed.unsqueeze(0),
+            source_audio.unsqueeze(0).to(device),
             lambd=0.0
         )
         pred_mels = pred_mels.squeeze(0)
     
     logger.info(f"Predicted mel-spectrogram shape: {pred_mels.shape}")
+    
+    # Safety: if for any reason there is a 1-frame mismatch (rounding), fix it.
+    target_mel_len = int(np.ceil(len(source_audio) / config.hop_length))
+    if pred_mels.size(0) != target_mel_len:
+        logger.warning(f"Frame-length mismatch (pred={pred_mels.size(0)}, target={target_mel_len}). Applying final interpolation.")
+        pred_mels = torch.nn.functional.interpolate(
+            pred_mels.unsqueeze(0).permute(0, 2, 1),
+            size=target_mel_len,
+            mode="linear",
+            align_corners=False
+        ).permute(0, 2, 1).squeeze(0)
     
     # Synthesize audio
     if use_vocoder:
@@ -173,20 +191,40 @@ def inference(checkpoint_path, source_wav, ref_wav, output_wav, device, logger, 
                 if pred_mels.size(-1) != 80:
                     logger.warning(f"Mel-spectrogram dimension is {pred_mels.size(-1)}, but vocoder expects 80. This may lead to poor results.")
 
-                # Generate audio
+                # Generate audio (mel: B,n_mels,T)
+                # The HiFi-GAN vocoder expects (B, T, n_mels)
                 converted_audio = vocoder(pred_mels.unsqueeze(0))
                 converted_audio = converted_audio.squeeze().cpu()
             
         except Exception as e:
-            logger.warning(f"Vocoder failed, using simple synthesis: {e}")
-            converted_audio = simple_vocoder_synthesis(pred_mels.cpu(), len(source_audio))
+            logger.critical("="*50)
+            logger.critical("HIGH-QUALITY VOCODER FAILED TO LOAD.")
+            logger.critical(f"Reason: {e}")
+            logger.critical("FALLING BACK TO PLACEHOLDER AUDIO SYNTHESIS.")
+            logger.critical("The resulting audio quality will be EXTREMELY POOR.")
+            logger.critical("="*50)
+            converted_audio = griffin_lim_synthesis(pred_mels.cpu(), config, len(source_audio))
     else:
-        logger.info("Using simple synthesis...")
-        converted_audio = simple_vocoder_synthesis(pred_mels.cpu(), len(source_audio))
+        logger.warning("="*50)
+        logger.warning("HiFi-GAN vocoder was not enabled (`--use_vocoder` flag missing).")
+        logger.warning("Using placeholder audio synthesis. Quality will be low but functional.")
+        logger.warning("="*50)
+        converted_audio = griffin_lim_synthesis(pred_mels.cpu(), config, len(source_audio))
     
     # Save output
     logger.info(f"Saving converted audio to {output_wav}")
     sf.write(output_wav, converted_audio.numpy(), 16000)
+    
+    # --- Save original and reference audio for comparison ---
+    base, ext = os.path.splitext(output_wav)
+    
+    source_output_path = f"{base}_source{ext}"
+    logger.info(f"Saving original source audio for comparison to {source_output_path}")
+    sf.write(source_output_path, source_audio.numpy(), 16000)
+
+    ref_output_path = f"{base}_reference{ext}"
+    logger.info(f"Saving original reference audio for comparison to {ref_output_path}")
+    sf.write(ref_output_path, ref_audio.numpy(), 16000)
     
     logger.info("Voice conversion completed!")
     
@@ -200,25 +238,19 @@ def inference(checkpoint_path, source_wav, ref_wav, output_wav, device, logger, 
 def main():
     parser = argparse.ArgumentParser(description="RC-OP Voice Conversion Inference")
     parser.add_argument("--ckpt", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--source_wav", type=str, required=True, help="Source audio file")
-    parser.add_argument("--ref_wav", type=str, required=True, help="Reference speaker audio file")
-    parser.add_argument("--out_wav", type=str, required=True, help="Output audio file")
+    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save output files")
+    parser.add_argument("--source_wav", type=str, default=None, help="Source audio file (optional; random if not provided)")
+    parser.add_argument("--ref_wav", type=str, default=None, help="Reference speaker audio file (optional; random if not provided)")
+    parser.add_argument("--data_root", type=str, default="./data/VCTK-Corpus-0.92", help="Path to VCTK dataset (required for random mode)")
     parser.add_argument("--device", type=str, default="cuda", help="Device to use")
     parser.add_argument("--use_vocoder", action="store_true", help="Use HiFi-GAN vocoder")
     parser.add_argument("--log_dir", type=str, default="logs", help="Directory for logs")
+    parser.add_argument("--no_speaker_fusion", action="store_true", help="Generate audio from content features without speaker fusion.")
     
     args = parser.parse_args()
     
-    # Validate input files
-    if not os.path.exists(args.source_wav):
-        raise FileNotFoundError(f"Source audio file not found: {args.source_wav}")
-    if not os.path.exists(args.ref_wav):
-        raise FileNotFoundError(f"Reference audio file not found: {args.ref_wav}")
-    if not os.path.exists(args.ckpt):
-        raise FileNotFoundError(f"Checkpoint file not found: {args.ckpt}")
-    
     # Create output directory
-    os.makedirs(os.path.dirname(args.out_wav) if os.path.dirname(args.out_wav) else ".", exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
     
     # Setup logging
     os.makedirs(args.log_dir, exist_ok=True)
@@ -231,12 +263,61 @@ def main():
     # Set seed for reproducibility
     set_seed(Config().seed)
     logger.info(f"Using random seed: {Config().seed}")
+
+    source_wav_path = args.source_wav
+    ref_wav_path = args.ref_wav
+
+    # --- Automatic File Selection ---
+    if not source_wav_path or not ref_wav_path:
+        logger.info("Source or reference WAV not provided. Selecting random files from VCTK...")
+        from pathlib import Path
+        import random
+
+        if not os.path.isdir(args.data_root):
+            raise FileNotFoundError(f"VCTK data root not found for random selection: {args.data_root}")
+        
+        wav_parent_dir = Path(args.data_root) / "wav48_silence_trimmed"
+        if not wav_parent_dir.exists():
+             wav_parent_dir = Path(args.data_root) / "wav48"
+
+        speakers = [p for p in wav_parent_dir.iterdir() if p.is_dir()]
+        if len(speakers) < 2:
+            raise ValueError("Need at least two speakers in the dataset for random conversion.")
+
+        speaker1, speaker2 = random.sample(speakers, 2)
+        
+        source_wav_path = str(random.choice(list(speaker1.glob("*_mic1.flac"))))
+        ref_wav_path = str(random.choice(list(speaker2.glob("*_mic1.flac"))))
+
+        logger.info(f"Randomly selected source: {source_wav_path}")
+        logger.info(f"Randomly selected reference: {ref_wav_path}")
+    
+    # Validate input files
+    if not os.path.exists(source_wav_path):
+        raise FileNotFoundError(f"Source audio file not found: {source_wav_path}")
+    if not os.path.exists(ref_wav_path):
+        raise FileNotFoundError(f"Reference audio file not found: {ref_wav_path}")
+    if not os.path.exists(args.ckpt):
+        raise FileNotFoundError(f"Checkpoint file not found: {args.ckpt}")
+
+    # --- Generate descriptive output filename ---
+    from pathlib import Path
+    source_name = Path(source_wav_path).stem.replace("_mic1", "")
+    ref_name = Path(ref_wav_path).stem.replace("_mic1", "")
+    output_filename = f"converted_{source_name}_to_{ref_name}.wav"
+    output_wav_path = os.path.join(args.output_dir, output_filename)
     
     # Perform inference
     try:
         results = inference(
-            args.ckpt, args.source_wav, args.ref_wav, args.out_wav, 
-            device, logger, args.use_vocoder
+            checkpoint_path=args.ckpt, 
+            source_wav=source_wav_path,
+            ref_wav=ref_wav_path,
+            output_wav=output_wav_path, 
+            device=device, 
+            logger=logger, 
+            use_vocoder=args.use_vocoder, 
+            no_speaker_fusion=args.no_speaker_fusion
         )
         logger.info(f"Inference results: {results}")
     except Exception as e:

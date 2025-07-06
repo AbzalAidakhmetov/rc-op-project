@@ -6,7 +6,7 @@ A clean, modular implementation of RC-OP for voice conversion using WavLM-Large 
 
 RC-OP (Reference-Conditioned Orthogonal Projection) is a voice conversion method that:
 - Uses WavLM-Large for self-supervised speech representations
-- Employs Resemblyzer for speaker embeddings  
+- Employs a pre-trained SpeechBrain model for speaker embeddings
 - Applies orthogonal projection to explicitly remove speaker information from content features by projecting each frame onto the subspace orthogonal to a learned speaker axis
 - Uses gradient reversal to ensure speaker-agnostic content representations
 
@@ -93,7 +93,7 @@ python train.py \
   --save_dir checkpoints \
   --epochs 20 \
   --subset 500 \
-  --batch_size 1
+  --batch_size 16
 ```
 
 ### Evaluation
@@ -129,11 +129,11 @@ class Config:
     # Data
     target_sr: int = 16_000
     subset: int = 500
-    batch_size: int = 1
+    batch_size: int = 16
     
     # Model dimensions
     d_ssl: int = 1024      # WavLM-Large hidden size
-    d_spk: int = 256       # Resemblyzer size
+    d_spk: int = 192       # SpeechBrain ECAPA-TDNN size
     
     # Training
     epochs: int = 20
@@ -154,14 +154,15 @@ class Config:
 1. **Gradient Reversal**: Ensures content features are speaker-agnostic
 2. **Orthogonal Projection**: Mathematical removal of speaker components
 3. **SSL Features**: WavLM-Large provides rich content representations
-4. **Speaker Embeddings**: Resemblyzer provides speaker characteristics
+4. **Speaker Embeddings**: SpeechBrain `spkrec-ecapa-voxceleb` provides speaker characteristics
 
 ## Dependencies
 
 Key packages:
 - `torch>=2.2`: PyTorch framework
 - `transformers>=4.41`: WavLM and HiFi-GAN models
-- `resemblyzer`: Speaker embedding extraction
+- `speechbrain>=0.5.16`: Speaker embedding extraction
+- `timm>=0.9.16`: Required by SpeechBrain models
 - `soundfile`: Audio I/O
 - `resampy`: Audio resampling
 
