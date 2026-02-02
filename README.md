@@ -1,209 +1,170 @@
-# RC-OP: Reference-Conditioned Orthogonal Projection
+# Voice Conversion with Rectified Flow Matching
 
-A clean, modular implementation of RC-OP for voice conversion using WavLM-Large SSL features and orthogonal projection. This implementation is designed to run on VAST.ai GPU instances without Docker or Colab dependencies.
+A Voice Conversion system comparing two flow matching approaches:
 
-## Overview
+1. **Baseline CFM:** Standard Conditional Flow Matching starting from Gaussian Noise
+2. **SG-Flow:** Rectified Flow starting from Orthogonally Projected Content Subspace
 
-RC-OP (Reference-Conditioned Orthogonal Projection) is a voice conversion method that:
-- Uses WavLM-Large for self-supervised speech representations
-- Employs a pre-trained SpeechBrain model for speaker embeddings
-- Applies orthogonal projection to explicitly remove speaker information from content features by projecting each frame onto the subspace orthogonal to a learned speaker axis
-- Uses gradient reversal to ensure speaker-agnostic content representations
+## Core Hypothesis
+
+The SG-Flow method removes speaker information via SVD projection before the flow process, potentially leading to:
+- Better content preservation
+- Cleaner speaker conversion
+- More interpretable latent space
+
+## Architecture
+
+- **Backbone:** `microsoft/wavlm-base-plus` (Frozen, 768-dim)
+- **Flow Target:** Native WavLM features (768-dim)
+- **Conditioning:** Target Speaker Embedding (ECAPA-TDNN, 192-dim)
+- **Decoder:** 1D ResNet mapping WavLM → Mel-Spectrogram
+- **Vocoder:** Pre-trained HiFi-GAN
 
 ## Project Structure
 
 ```
-rc-op/
-├── README.md
-├── requirements.txt
-├── setup.sh                    # Single comprehensive setup script
-├── config.py                   # Configuration settings
-├── train.py                    # Training script
-├── evaluate.py                 # Evaluation script  
-├── infer.py                    # Inference script
+voice-conversion-flow/
+├── config.py                 # Configuration (SAMPLE_RATE, WAVLM_DIM, etc.)
+├── train.py                  # Training with phased learning + AMP
+├── inference.py              # Inference with Euler ODE solver
+├── playground.ipynb          # Quick experimentation notebook
+├── setup.sh                  # One-command setup (uv-based)
+├── pyproject.toml            # Dependencies
+│
 ├── data/
-│   ├── __init__.py
-│   └── vctk.py                # VCTK dataset handling
+│   ├── preprocess.py         # Feature extraction (LibriTTS/VCTK)
+│   ├── dataset.py            # PyTorch Dataset for precomputed features
+│   └── vctk.py               # Legacy VCTK loader
+│
 ├── models/
-│   ├── __init__.py
-│   ├── rcop.py                # Main RC-OP model
-│   ├── grad_reverse.py        # Gradient reversal layer
-│   └── projection.py          # Orthogonal projection
+│   ├── flow_network.py       # Transformer-based velocity prediction
+│   ├── flow_matching.py      # BaselineCFM and SGFlow implementations
+│   ├── decoder.py            # 1D ResNet decoder (WavLM → Mel)
+│   ├── projection.py         # Orthogonal projection module
+│   └── system.py             # VoiceConversionSystem wrapper
+│
 └── utils/
-    ├── __init__.py
-    ├── phonemes.py            # Phoneme utilities
-    └── logging.py             # Logging utilities
+    ├── svd_projection.py     # SVD computation for speaker subspace
+    ├── checkpoint.py         # Model checkpointing
+    └── logging.py            # Logging utilities
 ```
 
-## Quick Setup
+## Quick Start
 
-### One-Command Installation
+### 1. Setup Environment
 
 ```bash
-# Run the comprehensive setup script
-bash setup.sh
+# One-command setup (downloads LibriTTS dev-clean ~1.2GB)
+./setup.sh
+
+# Activate environment
+source .venv/bin/activate
 ```
 
-This single script will:
-1. ✅ Install Miniconda if not present
-2. ✅ Create and activate the `rcop` conda environment
-3. ✅ Install all Python dependencies
-4. ✅ Download pre-trained models (WavLM-Large, etc.)
-5. ✅ Download and extract the VCTK dataset
-6. ✅ Create necessary directories (checkpoints, logs)
-7. ✅ Verify the complete setup
-
-### Manual Setup (Alternative)
-
-If you prefer manual setup:
+### 2. Preprocess Data
 
 ```bash
-# Create Python environment
-conda create -n rcop python=3.10 -y && conda activate rcop
-# OR
-python -m venv .venv && source .venv/bin/activate
+# Extract WavLM features, speaker embeddings, and mel spectrograms
+python data/preprocess.py \
+    --data_root ./data/LibriTTS/dev-clean \
+    --output_dir ./preprocessed
 
-# Install dependencies
-pip install -r requirements.txt
-
-# Download models
-python download_models.py
-
-# Download VCTK dataset
-bash download_vctk.sh ./data
-
-# Create directories
-mkdir -p checkpoints logs
+# Compute SVD projection matrix
+python utils/svd_projection.py \
+    --data_dir ./preprocessed \
+    --output ./preprocessed/projection_matrix.pt
 ```
 
-## Usage
-
-### Training
+### 3. Train Models
 
 ```bash
-# Activate environment (if not already active)
-conda activate rcop
+# Train Baseline CFM (from Gaussian noise)
+python train.py --mode baseline --data_dir ./preprocessed
 
-# Set VCTK data path
-export VCTK_ROOT=./data/VCTK-Corpus-0.92
-
-# Start training
-python train.py \
-  --data_root $VCTK_ROOT \
-  --save_dir checkpoints \
-  --epochs 20 \
-  --subset 500 \
-  --batch_size 16
+# Train SG-Flow (from content subspace)
+python train.py --mode sg_flow --data_dir ./preprocessed
 ```
 
-### Evaluation
+### 4. Inference
 
 ```bash
-python evaluate.py \
-  --ckpt checkpoints/rcop_epoch20.pt \
-  --data_root $VCTK_ROOT \
-  --subset 100
+python inference.py \
+    --checkpoint checkpoints/sg_flow_best.pt \
+    --source_wav path/to/source.wav \
+    --ref_wav path/to/reference.wav \
+    --output_dir results/
 ```
 
-### Inference
+## Training Details
 
-```bash
-python infer.py \
-  --ckpt checkpoints/rcop_epoch20.pt \
-  --source_wav /path/to/source.wav \
-  --ref_wav /path/to/reference.wav \
-  --out_wav output.wav \
-  --use_vocoder
-```
+### Phased Training
 
-## Configuration
+- **Phase A (Steps 1-2000):** Train Decoder only (Flow frozen)
+  - Ensures mel reconstruction works before training flow
+- **Phase B (Steps 2001-20000):** Train Flow + Decoder jointly
 
-The `config.py` file contains all hyperparameters:
+### Key Parameters
 
 ```python
-@dataclass
-class Config:
-    device: str = "cuda"
-    seed: int = 42
-    
-    # Data
-    target_sr: int = 16_000
-    subset: int = 500
-    batch_size: int = 16
-    
-    # Model dimensions
-    d_ssl: int = 1024      # WavLM-Large hidden size
-    d_spk: int = 192       # SpeechBrain ECAPA-TDNN size
-    
-    # Training
-    epochs: int = 20
-    lr: float = 1e-4
-    lambda_ramp: bool = True
+SAMPLE_RATE = 16000
+WAVLM_DIM = 768        # wavlm-base-plus hidden size
+BATCH_SIZE = 8         # RTX 3090 friendly
+LR = 1e-4
+NUM_STEPS = 20000      # Total training steps
+svd_rank = 64          # Speaker subspace dimensions
 ```
 
-## Model Architecture
+## Dataset
 
-### RC-OP Model
-- **Speaker Projection Layer**: Linear layer that learns speaker-specific axes
-- **Phoneme Classifier**: Predicts phonemes from projected features
-- **Speaker Classifier**: Adversarial classifier with gradient reversal
-- **Orthogonal Projection**: Removes speaker information from SSL features
+**LibriTTS dev-clean** (recommended for quick experiments):
+- Size: ~1.2 GB
+- Speakers: ~40 speakers
+- Format: 24kHz WAV, sentence-level segments
+- Download: Automatic via `setup.sh`
 
-### Key Components
+Also supports VCTK (auto-detected by preprocessing script).
 
-1. **Gradient Reversal**: Ensures content features are speaker-agnostic
-2. **Orthogonal Projection**: Mathematical removal of speaker components
-3. **SSL Features**: WavLM-Large provides rich content representations
-4. **Speaker Embeddings**: SpeechBrain `spkrec-ecapa-voxceleb` provides speaker characteristics
+## Playground Notebook
 
-## Dependencies
-
-Key packages:
-- `torch>=2.2`: PyTorch framework
-- `transformers>=4.41`: WavLM and HiFi-GAN models
-- `speechbrain>=0.5.16`: Speaker embedding extraction
-- `timm>=0.9.16`: Required by SpeechBrain models
-- `soundfile`: Audio I/O
-- `resampy`: Audio resampling
-
-## Troubleshooting
-
-### Common Issues
-
-1. **Conda not found**: The setup script will automatically install Miniconda
-2. **CUDA out of memory**: Reduce batch size or use CPU training
-3. **VCTK download fails**: Check internet connection and try again
-4. **Model download fails**: Ensure transformers cache directory is writable
-
-### WavLM Model Download Issues
-
-If you encounter errors during model download like:
-```
-OSError: Can't load tokenizer for 'microsoft/wavlm-large'
-```
-
-This is usually due to:
-- **Network connectivity issues**: Check your internet connection
-- **Transformers version compatibility**: The setup uses transformers>=4.41,<4.45
-- **Model availability**: The model should be available on HuggingFace
-
-**Solutions:**
-1. **Automatic retry**: The setup script will continue even if model download fails. Models will be downloaded automatically when first used.
-2. **Manual download**: After setup, run:
-   ```bash
-   conda activate rcop
-   python download_models.py
-   ```
-3. **Test setup**: After setup, verify everything works:
-   ```bash
-   conda activate rcop
-   python test_setup.py
-   ```
-
-### Environment Variables
+For quick experimentation without full training:
 
 ```bash
-# Set these for optimal performance
-export CUDA_VISIBLE_DEVICES=0  # Use specific GPU
-export VCTK_ROOT=./data/VCTK-Corpus-0.92  # VCTK dataset path
-``` 
+jupyter notebook playground.ipynb
+```
+
+The notebook includes:
+- Model architecture verification
+- Loss computation comparison
+- Quick training on synthetic data
+- ODE solver visualization
+
+## Flow Matching Methods
+
+### Baseline CFM
+```
+x_0 ~ N(0, I)                    # Start from Gaussian noise
+x_t = (1-t)*x_0 + t*x_1          # Linear interpolation
+v_target = x_1 - x_0             # Target velocity
+Loss = MSE(v_pred, v_target)     # Flow matching loss
+```
+
+### SG-Flow
+```
+x_0 = P_content @ x_1            # Start from content projection
+x_t = (1-t)*x_0 + t*x_1          # Linear interpolation
+v_target = x_1 - x_0             # Target velocity (smaller!)
+Loss = MSE(v_pred, v_target)     # Flow matching loss
+```
+
+The key insight: SG-Flow starts closer to the target, so the flow only needs to learn the speaker-specific transformation.
+
+## Requirements
+
+- Python 3.10+
+- PyTorch 2.0+
+- CUDA (RTX 3090 recommended)
+- ~4GB GPU memory for training
+
+## License
+
+MIT

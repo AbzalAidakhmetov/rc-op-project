@@ -178,17 +178,15 @@ dmypy.json
 *.nef
 *.arw
 
-# Large data directories
-models/
-data/txt
-data/wav48_silence_trimmed/
-data/speaker-info.txt
-data/update.txt
-data/VCTK-Corpus-0.92.zip
-data/raw/
-data/processed/
-data/external/
-data/interim/
+# Downloaded/cached models (HuggingFace, SpeechBrain)
+# Note: models/*.py source files are tracked, but cache dirs are ignored
+models/models--*/
+models/.locks/
+models/spkrec-*/
+model_cache/
+
+# Keep .gitkeep files
+!**/.gitkeep
 datasets/
 dataset/
 audio/
@@ -199,6 +197,31 @@ checkpoints/
 runs/
 wandb/
 mlruns/
+
+# LibriTTS dataset
+data/LibriTTS/
+data/dev-clean/
+data/dev-clean.tar.gz
+
+# VCTK dataset
+data/VCTK-Corpus-0.92/
+data/VCTK-Corpus-0.92.zip
+data/txt/
+data/wav48/
+data/wav48_silence_trimmed/
+data/speaker-info.txt
+data/update.txt
+
+# Preprocessed features
+preprocessed/
+data/preprocessed/
+data/raw/
+data/processed/
+data/external/
+data/interim/
+
+# Results and outputs
+results/
 
 # Model files and checkpoints
 models/checkpoints/

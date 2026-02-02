@@ -36,9 +36,20 @@ def main():
     
     try:
         from transformers import WavLMModel, Wav2Vec2FeatureExtractor
+        # Some torchaudio builds (e.g., minimal stubs) lack list_audio_backends,
+        # which SpeechBrain expects at import time.
+        try:
+            import torchaudio  # noqa: F401
+            if not hasattr(torchaudio, "list_audio_backends"):
+                torchaudio.list_audio_backends = lambda: []  # type: ignore[attr-defined]
+        except Exception as e:
+            print(f"Warning: torchaudio initialization issue: {e}")
         from speechbrain.inference import EncoderClassifier
     except ImportError as e:
-        print(f"Required library not found: {e}. Please run `pip install -r requirements.txt` first.")
+        print(f"Required library not found: {e}. Please run `pip install -e .` first.")
+        return 1
+    except Exception as e:
+        print(f"Error initializing model downloads: {e}")
         return 1
         
     # Download WavLM
