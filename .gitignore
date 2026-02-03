@@ -310,3 +310,4 @@ dvc.lock
 
 # Test scripts
 test_setup.py 
+outputs/
