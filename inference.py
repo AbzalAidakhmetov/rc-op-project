@@ -1,324 +1,221 @@
 #!/usr/bin/env python3
 """
-Inference script for Voice Conversion with Rectified Flow Matching.
-
-Pipeline:
-1. Take Source Audio -> Extract WavLM features
-2. If SG-Flow: Project to Content Subspace (x_0 = P_content @ x)
-   If Baseline: Sample Noise (x_0 ~ N(0,I))
-3. Solve ODE using Euler solver (10-20 steps)
-4. Decoder(x_1) -> Mel spectrogram
-5. HiFi-GAN(Mel) -> Audio
+Inference script for second.py checkpoints (FlowMatchingResNet).
+Loads a trained checkpoint and converts audio files.
 
 Usage:
-    python inference.py --checkpoint checkpoints/sg_flow_best.pt \
-        --source_wav source.wav --ref_wav reference.wav \
-        --output_dir results/
+    # Basic conversion (auto-picks VCTK speakers if no source/target given)
+    python inference.py --checkpoint outputs_source/checkpoint_0002000.pt
+
+    # Specify source and target audio
+    python inference.py --checkpoint outputs_svd_20k/model_final.pt \
+        --source path/to/source.wav --target path/to/target_speaker.wav
+
+    # More ODE steps for better quality
+    python inference.py --checkpoint outputs_svd_20k/model_final.pt --ode-steps 64
+
+    # Batch: convert source to multiple target speakers
+    python inference.py --checkpoint outputs_svd_20k/model_final.pt \
+        --source path/to/source.wav \
+        --target speaker1.wav speaker2.wav speaker3.wav
 """
 
 import argparse
-import os
 from pathlib import Path
 
-import torch
-import torch.nn.functional as F
-import soundfile as sf
 import numpy as np
-from transformers import Wav2Vec2FeatureExtractor, WavLMModel, SpeechT5HifiGan
-from speechbrain.inference import EncoderClassifier
-from resampy import resample
-from tqdm import tqdm
+import soundfile as sf
+import torch
 
-from config import Config
-from models.flow_matching import create_flow_model
-from models.decoder import WavLMToMelDecoder
-from models.system import VoiceConversionSystem
-from models.projection import OrthogonalProjection
-from utils.logging import setup_logger
-
-
-MODEL_CACHE_DIR = "./models"
-
-
-def load_audio(file_path: str, target_sr: int = 16000) -> torch.Tensor:
-    """Load and resample audio file."""
-    audio, orig_sr = sf.read(file_path)
-    if len(audio.shape) > 1:
-        audio = audio[:, 0]
-    if orig_sr != target_sr:
-        audio = resample(audio, orig_sr, target_sr)
-    return torch.from_numpy(audio).float()
+# Import everything from second.py (model, feature extraction, inference logic)
+from second import (
+    FlowMatchingResNet,
+    FeatureExtractor,
+    FlowMode,
+    convert_voice,
+    load_audio,
+    WAVLM_SR,
+    VOCOS_SR,
+    VCTK_ROOT,
+    ODE_STEPS,
+    GUIDANCE_SCALE,
+)
 
 
-class FeatureExtractor:
-    """Extract WavLM features and speaker embeddings for inference."""
-    
-    def __init__(self, config: Config, device: str = "cuda"):
-        self.config = config
-        self.device = device
-        
-        print("Loading WavLM model...")
-        self.wavlm_processor = Wav2Vec2FeatureExtractor.from_pretrained(
-            config.wavlm_name, cache_dir=MODEL_CACHE_DIR
-        )
-        self.wavlm_model = WavLMModel.from_pretrained(
-            config.wavlm_name, cache_dir=MODEL_CACHE_DIR
-        )
-        self.wavlm_model.eval()
-        self.wavlm_model.requires_grad_(False)
-        self.wavlm_model.to(device)
-        
-        print("Loading speaker encoder...")
-        self.speaker_model = EncoderClassifier.from_hparams(
-            source=config.speaker_model_name,
-            savedir=os.path.join(MODEL_CACHE_DIR, "spkrec-ecapa-voxceleb"),
-            run_opts={"device": device}
-        )
-        self.speaker_model.eval()
-    
-    @torch.no_grad()
-    def extract_wavlm(self, audio: torch.Tensor) -> torch.Tensor:
-        """Extract WavLM features."""
-        inputs = self.wavlm_processor(
-            audio.cpu().numpy(),
-            sampling_rate=self.config.SAMPLE_RATE,
-            return_tensors="pt"
-        )
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        
-        outputs = self.wavlm_model(**inputs, output_hidden_states=True)
-        
-        if self.config.wavlm_layer == -1:
-            features = outputs.last_hidden_state.squeeze(0)
-        else:
-            features = outputs.hidden_states[self.config.wavlm_layer].squeeze(0)
-        
-        return features
-    
-    @torch.no_grad()
-    def extract_speaker_embedding(self, audio: torch.Tensor) -> torch.Tensor:
-        """Extract speaker embedding."""
-        audio_device = audio.to(self.device)
-        embedding = self.speaker_model.encode_batch(audio_device.unsqueeze(0))
-        return embedding.squeeze()
-
-
-def euler_ode_solve(
-    flow_model,
-    x0: torch.Tensor,
-    target_spk: torch.Tensor,
-    num_steps: int = 20,
-) -> torch.Tensor:
+def load_checkpoint(path: str, device: str):
     """
-    Euler ODE solver for flow matching.
-    
-    Solves: dx/dt = v(x_t, t, spk) from t=0 to t=1
-    Using: x_{t+dt} = x_t + v(x_t, t, spk) * dt
+    Load a second.py checkpoint and return model + metadata.
+    Works with both model_final.pt and checkpoint_NNNNNNN.pt files.
     """
-    device = x0.device
-    B = x0.shape[0]
-    
-    dt = 1.0 / num_steps
-    x_t = x0.clone()
-    
-    for i in tqdm(range(num_steps), desc="ODE Solving", leave=False):
-        t = torch.full((B,), i / num_steps, device=device)
-        v = flow_model.velocity_net(x_t, t, target_spk)
-        x_t = x_t + v * dt
-    
-    return x_t
+    print(f"Loading checkpoint: {path}")
+    ckpt = torch.load(path, map_location="cpu")
 
+    # Extract saved config (with sensible defaults for older checkpoints)
+    mode = ckpt.get("mode", "svd")
+    svd_proj = ckpt.get("svd_proj", None)
+    step = ckpt.get("step", "?")
+    wavlm_layer = ckpt.get("wavlm_layer", -1)
+    use_instance_norm = ckpt.get("instance_norm", False)
 
-def load_model(checkpoint_path: str, config: Config, device: str) -> VoiceConversionSystem:
-    """Load trained model from checkpoint."""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    mode = checkpoint.get("mode", "sg_flow")
-    ckpt_config = checkpoint.get("config", {})
-    
-    # Get model parameters from checkpoint config
-    d_model = ckpt_config.get("d_model", 512)
-    num_layers = ckpt_config.get("num_layers", 6)
-    num_heads = ckpt_config.get("num_heads", 8)
-    dropout = ckpt_config.get("dropout", 0.1)
-    projection_path = ckpt_config.get("projection_path", None)
-    
-    # Create model
-    flow_model = create_flow_model(
-        method=mode,
-        d_input=config.WAVLM_DIM,
-        d_model=d_model,
-        d_spk=config.d_spk,
-        num_layers=num_layers,
-        num_heads=num_heads,
-        dropout=dropout,
-        projection_path=projection_path,
-    )
-    
-    decoder = WavLMToMelDecoder(
-        d_wavlm=config.WAVLM_DIM,
-        d_spk=config.d_spk,
-        d_hidden=config.decoder_hidden_dim,
-        n_mels=config.n_mels,
-        num_layers=config.decoder_num_layers,
-    )
-    
-    projection = None
-    if projection_path and os.path.exists(projection_path):
-        projection = OrthogonalProjection(projection_path=projection_path)
-    
-    model = VoiceConversionSystem(flow_model, decoder, projection)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.to(device)
+    # Build and load model
+    model = FlowMatchingResNet()
+    model.load_state_dict(ckpt["model"])
+    model = model.to(device)
     model.eval()
-    
-    return model, mode
+
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  Step           : {step}")
+    print(f"  Mode           : {mode}")
+    print(f"  WavLM layer    : {wavlm_layer} ({'last' if wavlm_layer == -1 else wavlm_layer})")
+    print(f"  Instance norm  : {use_instance_norm}")
+    print(f"  SVD projection : {'yes' if svd_proj is not None else 'no'}")
+    print(f"  Parameters     : {n_params:,}")
+
+    return model, svd_proj, FlowMode(mode), wavlm_layer, use_instance_norm
 
 
-def convert_voice(
-    model: VoiceConversionSystem,
-    source_wavlm: torch.Tensor,
-    target_spk: torch.Tensor,
-    mode: str,
-    num_steps: int = 20,
-    device: str = "cuda",
-) -> torch.Tensor:
-    """
-    Perform voice conversion.
-    
-    Args:
-        model: Trained VoiceConversionSystem
-        source_wavlm: (T, D) source WavLM features
-        target_spk: (D_spk,) target speaker embedding
-        mode: "baseline" or "sg_flow"
-        num_steps: ODE solver steps
-        device: compute device
-    
-    Returns:
-        mel: (T_mel, n_mels) converted mel spectrogram
-    """
-    source_wavlm = source_wavlm.unsqueeze(0).to(device)
-    target_spk = target_spk.unsqueeze(0).to(device)
-    
-    with torch.no_grad():
-        # Get starting point based on mode
-        if mode == "sg_flow":
-            # Project source to content subspace
-            x0 = model.flow_model.sample.__self__.projection.project_content(source_wavlm)
-        else:
-            # Baseline: start from Gaussian noise
-            x0 = torch.randn_like(source_wavlm)
-        
-        # Solve ODE: x_0 -> x_1
-        x1 = euler_ode_solve(model.flow_model, x0, target_spk, num_steps)
-        
-        # Decode to mel spectrogram
-        mel = model.decoder(x1, target_spk)
-    
-    return mel.squeeze(0)
-
-
-def mel_to_audio(mel: torch.Tensor, device: str = "cuda") -> torch.Tensor:
-    """Convert mel spectrogram to audio using HiFi-GAN."""
-    print("Loading HiFi-GAN vocoder...")
-    vocoder = SpeechT5HifiGan.from_pretrained(
-        "microsoft/speecht5_hifigan", cache_dir=MODEL_CACHE_DIR
+def find_default_audio(data_dir: Path, speaker_idx: int = 0, file_idx: int = 0):
+    """Pick a default audio file from VCTK."""
+    speakers = sorted(
+        d.name for d in data_dir.iterdir()
+        if d.is_dir() and d.name.startswith("p")
     )
-    vocoder.to(device)
-    vocoder.eval()
-    
-    with torch.no_grad():
-        # HiFi-GAN expects (B, T, n_mels)
-        audio = vocoder(mel.unsqueeze(0).to(device))
-        audio = audio.squeeze().cpu()
-    
-    return audio
+    if not speakers:
+        raise FileNotFoundError(f"No speaker directories found in {data_dir}")
+    spk = speakers[min(speaker_idx, len(speakers) - 1)]
+    spk_dir = data_dir / spk
+    files = sorted(spk_dir.glob("*_mic1.flac"))
+    if not files:
+        files = sorted(spk_dir.glob("*.flac"))
+    if not files:
+        files = sorted(spk_dir.glob("*.wav"))
+    if not files:
+        raise FileNotFoundError(f"No audio files in {spk_dir}")
+    return str(files[min(file_idx, len(files) - 1)]), spk
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Voice Conversion Inference")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Model checkpoint path")
-    parser.add_argument("--source_wav", type=str, required=True, help="Source audio file")
-    parser.add_argument("--ref_wav", type=str, required=True, help="Reference speaker audio file")
-    parser.add_argument("--output_dir", type=str, default="results", help="Output directory")
-    parser.add_argument("--num_steps", type=int, default=20, help="ODE solver steps (10-20)")
-    parser.add_argument("--device", type=str, default="cuda", help="Device")
-    parser.add_argument("--log_dir", type=str, default="logs", help="Log directory")
-    
+    parser = argparse.ArgumentParser(
+        description="Voice Conversion Inference (for second.py checkpoints)"
+    )
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Path to checkpoint (.pt file)")
+    parser.add_argument("--source", type=str, default=None,
+                        help="Source audio file (default: auto-pick from VCTK)")
+    parser.add_argument("--target", type=str, nargs="+", default=None,
+                        help="Target speaker reference(s) -- one or more files")
+    parser.add_argument("--output-dir", type=str, default="outputs_inference",
+                        help="Output directory (default: outputs_inference)")
+    parser.add_argument("--data-dir", type=str, default=str(VCTK_ROOT),
+                        help="VCTK data dir (used for auto-picking source/target)")
+    parser.add_argument("--ode-steps", type=int, default=ODE_STEPS,
+                        help=f"ODE solver steps (default: {ODE_STEPS})")
+    parser.add_argument("--guidance-scale", type=float, default=GUIDANCE_SCALE,
+                        help=f"CFG guidance scale (default: {GUIDANCE_SCALE})")
+    parser.add_argument("--max-duration", type=float, default=10.0,
+                        help="Max source audio duration in seconds (default: 10)")
+    # Allow overriding checkpoint settings
+    parser.add_argument("--wavlm-layer", type=int, default=None,
+                        help="Override WavLM layer from checkpoint")
+    parser.add_argument("--instance-norm", action="store_true", default=None,
+                        help="Override: force instance norm on")
     args = parser.parse_args()
-    
-    os.makedirs(args.output_dir, exist_ok=True)
-    os.makedirs(args.log_dir, exist_ok=True)
-    
-    logger = setup_logger("inference", args.log_dir)
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    
-    logger.info(f"Device: {device}")
-    logger.info(f"Source: {args.source_wav}")
-    logger.info(f"Reference: {args.ref_wav}")
-    logger.info(f"ODE steps: {args.num_steps}")
-    
-    config = Config()
-    
-    # Load feature extractor
-    logger.info("Loading feature extractor...")
-    extractor = FeatureExtractor(config, device)
-    
-    # Load model
-    logger.info(f"Loading model from {args.checkpoint}...")
-    model, mode = load_model(args.checkpoint, config, device)
-    logger.info(f"Model mode: {mode}")
-    
-    # Load audio files
-    logger.info("Loading audio files...")
-    source_audio = load_audio(args.source_wav, config.SAMPLE_RATE)
-    ref_audio = load_audio(args.ref_wav, config.SAMPLE_RATE)
-    
-    logger.info(f"Source duration: {len(source_audio)/config.SAMPLE_RATE:.2f}s")
-    logger.info(f"Reference duration: {len(ref_audio)/config.SAMPLE_RATE:.2f}s")
-    
-    # Extract features
-    logger.info("Extracting features...")
-    source_wavlm = extractor.extract_wavlm(source_audio)
-    target_spk = extractor.extract_speaker_embedding(ref_audio)
-    
-    logger.info(f"Source WavLM shape: {source_wavlm.shape}")
-    logger.info(f"Target speaker embedding shape: {target_spk.shape}")
-    
-    # Voice conversion
-    logger.info("Performing voice conversion...")
-    converted_mel = convert_voice(
-        model, source_wavlm, target_spk, mode,
-        num_steps=args.num_steps, device=device
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(exist_ok=True, parents=True)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}\n")
+
+    # ---- Load model ----
+    model, svd_proj, mode, wavlm_layer, use_instance_norm = load_checkpoint(
+        args.checkpoint, device
     )
-    logger.info(f"Converted mel shape: {converted_mel.shape}")
-    
-    # Synthesize audio
-    logger.info("Synthesizing audio with HiFi-GAN...")
-    converted_audio = mel_to_audio(converted_mel, device)
-    logger.info(f"Converted audio length: {len(converted_audio)/config.SAMPLE_RATE:.2f}s")
-    
-    # Save outputs
-    source_name = Path(args.source_wav).stem
-    ref_name = Path(args.ref_wav).stem
-    
-    output_path = os.path.join(
-        args.output_dir, 
-        f"converted_{source_name}_to_{ref_name}_{mode}.wav"
-    )
-    sf.write(output_path, converted_audio.numpy(), config.SAMPLE_RATE)
-    logger.info(f"Saved converted audio to {output_path}")
-    
-    # Also save source and reference for comparison
-    source_copy_path = os.path.join(args.output_dir, f"source_{source_name}.wav")
-    ref_copy_path = os.path.join(args.output_dir, f"reference_{ref_name}.wav")
-    
-    sf.write(source_copy_path, source_audio.numpy(), config.SAMPLE_RATE)
-    sf.write(ref_copy_path, ref_audio.numpy(), config.SAMPLE_RATE)
-    
-    logger.info(f"Saved source copy to {source_copy_path}")
-    logger.info(f"Saved reference copy to {ref_copy_path}")
-    logger.info("Voice conversion complete!")
+
+    # Allow CLI overrides
+    if args.wavlm_layer is not None:
+        wavlm_layer = args.wavlm_layer
+        print(f"  (override) WavLM layer: {wavlm_layer}")
+    if args.instance_norm is not None:
+        use_instance_norm = args.instance_norm
+        print(f"  (override) Instance norm: {use_instance_norm}")
+
+    # ---- Load feature extractor ----
+    print("\nLoading frozen models (WavLM, Vocos, ECAPA) ...")
+    feat_ext = FeatureExtractor(device=device).to(device)
+
+    # ---- Resolve source audio ----
+    data_dir = Path(args.data_dir)
+    if args.source:
+        source_path = args.source
+    else:
+        source_path, src_spk = find_default_audio(data_dir, speaker_idx=0)
+        print(f"\nAuto-selected source speaker: {src_spk}")
+
+    # ---- Resolve target audio(s) ----
+    if args.target:
+        target_paths = args.target
+    else:
+        # Pick a different speaker than source
+        tp, tgt_spk = find_default_audio(data_dir, speaker_idx=4)
+        target_paths = [tp]
+        print(f"Auto-selected target speaker: {tgt_spk}")
+
+    # ---- Load source audio ----
+    print(f"\nSource: {source_path}")
+    src_16k = load_audio(source_path, WAVLM_SR, max_sec=args.max_duration)
+    src_24k = load_audio(source_path, VOCOS_SR, max_sec=args.max_duration)
+    src_dur = len(src_24k) / VOCOS_SR
+    print(f"  Duration: {src_dur:.2f}s")
+
+    # Save original for easy comparison
+    src_name = Path(source_path).stem
+    orig_path = output_dir / f"{src_name}_original.wav"
+    sf.write(str(orig_path), src_24k.numpy(), VOCOS_SR)
+    print(f"  Saved original: {orig_path}")
+
+    # ---- Convert to each target ----
+    print(f"\nODE steps: {args.ode_steps}  |  Guidance: {args.guidance_scale}  |  Mode: {mode.value}")
+    print("-" * 60)
+
+    for target_path in target_paths:
+        tgt_name = Path(target_path).stem
+        print(f"\nTarget ref: {target_path}")
+
+        tgt_16k = load_audio(target_path, WAVLM_SR, max_sec=5.0)
+
+        # Save target speaker reference so you can hear their real voice
+        tgt_24k = load_audio(target_path, VOCOS_SR, max_sec=5.0)
+        tgt_ref_path = output_dir / f"{tgt_name}_target_reference.wav"
+        sf.write(str(tgt_ref_path), tgt_24k.numpy(), VOCOS_SR)
+        print(f"  Target voice : {tgt_ref_path} ({len(tgt_24k) / VOCOS_SR:.2f}s)")
+
+        # Conversion
+        conv_np, conv_dur = convert_voice(
+            model, feat_ext, src_16k, src_24k, tgt_16k,
+            svd_proj, mode, device,
+            ode_steps=args.ode_steps, guidance=args.guidance_scale,
+            wavlm_layer=wavlm_layer, use_instance_norm=use_instance_norm,
+        )
+        conv_path = output_dir / f"{src_name}_to_{tgt_name}.wav"
+        sf.write(str(conv_path), conv_np, VOCOS_SR)
+        print(f"  Converted    : {conv_path} ({conv_dur:.2f}s)")
+
+        # Reconstruction (same speaker as source)
+        recon_np, recon_dur = convert_voice(
+            model, feat_ext, src_16k, src_24k, src_16k,
+            svd_proj, mode, device,
+            ode_steps=args.ode_steps, guidance=args.guidance_scale,
+            wavlm_layer=wavlm_layer, use_instance_norm=use_instance_norm,
+        )
+        recon_path = output_dir / f"{src_name}_reconstructed.wav"
+        sf.write(str(recon_path), recon_np, VOCOS_SR)
+        print(f"  Reconstructed: {recon_path} ({recon_dur:.2f}s)")
+
+    # ---- Summary ----
+    print(f"\n{'=' * 60}")
+    print("DONE! All outputs in:", output_dir)
+    print(f"{'=' * 60}")
 
 
 if __name__ == "__main__":
