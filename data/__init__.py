@@ -1,15 +1,13 @@
-"""
-Data module for Voice Conversion with Rectified Flow Matching.
+"""Data module for NeuralKNN-VC.
 
-Contains:
-- preprocess.py: Feature extraction for LibriTTS/VCTK
-- dataset.py: PyTorch Dataset for precomputed features
+Speaker-grouped 16 kHz audio loading for the kNN-VC backbone and the pool-free
+neural converter's distillation.
 """
 
-from .dataset import PrecomputedVCDataset, create_dataloader, collate_fn
+from .dataset import AudioFolderDataset, build_dataloader, collate_fn
 
 __all__ = [
-    "PrecomputedVCDataset",
-    "create_dataloader",
+    "AudioFolderDataset",
+    "build_dataloader",
     "collate_fn",
 ]

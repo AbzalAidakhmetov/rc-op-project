@@ -312,3 +312,5 @@ dvc.lock
 test_setup.py 
 outputs/
 data/
+# ECAPA speaker-encoder download cache (speechbrain savedir)
+models/ecapa_voxceleb/
