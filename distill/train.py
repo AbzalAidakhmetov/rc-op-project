@@ -38,6 +38,7 @@ from models.speaker import SpeakerEncoder
 from models.converter import NeuralConverter
 from data.dataset import AudioFolderDataset
 from distill.dataset_gen import make_distill_batch
+from distill.cached_gen import CachedDistillSampler
 from utils import load_audio, save_wav
 
 try:
@@ -78,6 +79,14 @@ def parse_args():
     p.add_argument("--demo-every", type=int, default=1000,
                    help="Run a quick demo conversion every N steps (0 = off).")
     p.add_argument("--save-every", type=int, default=2000)
+    p.add_argument("--cache-dir", type=str, default=None,
+                   help="Precomputed feature cache (distill.precompute). ~50x faster; "
+                        "skips on-the-fly WavLM extraction in the training loop.")
+    p.add_argument("--resume", type=str, default=None,
+                   help="Resume from a full-state checkpoint (model+optimizer+step).")
+    p.add_argument("--heldout", type=int, default=0,
+                   help="Reserve the LAST N speakers (sorted) for evaluation; train on the rest. "
+                        "Cached path only.")
     p.add_argument("--no-wandb", action="store_true")
     return p.parse_args()
 
@@ -183,6 +192,24 @@ def main():
         max_files_per_speaker=config.max_files_per_speaker,
     )
 
+    # ---- fast cached sampler (precomputed features) vs on-the-fly teacher ----
+    sampler = None
+    if args.cache_dir:
+        allowed = None
+        if args.heldout and args.heldout > 0:
+            allowed = dataset.speakers[: -args.heldout]
+            heldout_spk = dataset.speakers[-args.heldout:]
+            with open(out_dir / "heldout_speakers.json", "w") as f:
+                import json as _json
+                _json.dump({"train": allowed, "heldout": heldout_spk}, f)
+            print(f"  held-out (eval) speakers: {heldout_spk}")
+        sampler = CachedDistillSampler(
+            cache_dir=args.cache_dir, device=device, topk=topk,
+            crop_frames=int(round(config.crop_sec * 50)),  # WavLM ~50 Hz
+            pool_utts=args.pool_utts, allowed_speakers=allowed,
+        )
+        print("  using PRECOMPUTED cache (fast path)")
+
     # ---- trainable converter ----
     converter = NeuralConverter(
         feat_dim=config.wavlm_dim,
@@ -209,21 +236,48 @@ def main():
     use_amp = device == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
+    # ---- resume from a full-state checkpoint ----
+    start_step = 0
+    if args.resume and Path(args.resume).exists():
+        ck = torch.load(args.resume, map_location=device)
+        converter.load_state_dict(ck["model"])
+        if "optimizer" in ck:
+            optimizer.load_state_dict(ck["optimizer"])
+        if "scheduler" in ck:
+            scheduler.load_state_dict(ck["scheduler"])
+        if "scaler" in ck and use_amp:
+            scaler.load_state_dict(ck["scaler"])
+        start_step = int(ck.get("step", 0))
+        print(f"Resumed from {args.resume} at step {start_step}")
+
+    def save_ckpt(step):
+        torch.save({
+            "model": converter.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict(),
+            "step": step,
+            "config": vars(config),
+        }, out_dir / "converter.pt")
+
     if use_wandb:
         wandb.init(project="neural-knn-vc", config=vars(config))
 
     # ---- training loop ----
     running = []
-    for step in range(config.steps):
-        batch = make_distill_batch(
-            knnvc, spk_enc, dataset, device,
-            batch_size=config.batch_size,
-            topk=topk,
-            pool_utts=args.pool_utts,
-            crop_sec=config.crop_sec,
-            pool_sec=(args.pool_sec if args.pool_sec and args.pool_sec > 0 else None),
-            ref_sec=(args.ref_sec if args.ref_sec and args.ref_sec > 0 else None),
-        )
+    for step in range(start_step, config.steps):
+        if sampler is not None:
+            batch = sampler.sample_batch(config.batch_size)
+        else:
+            batch = make_distill_batch(
+                knnvc, spk_enc, dataset, device,
+                batch_size=config.batch_size,
+                topk=topk,
+                pool_utts=args.pool_utts,
+                crop_sec=config.crop_sec,
+                pool_sec=(args.pool_sec if args.pool_sec and args.pool_sec > 0 else None),
+                ref_sec=(args.ref_sec if args.ref_sec and args.ref_sec > 0 else None),
+            )
         source_feats = batch["source_feats"]   # (B, T, 1024)
         spk_emb = batch["spk_emb"]             # (B, 192)
         target_feats = batch["target_feats"]   # (B, T, 1024)
@@ -235,6 +289,11 @@ def main():
             loss, l1, cos = masked_distill_loss(
                 converted.float(), target_feats.float(), lengths, config.use_cosine_loss
             )
+
+        if not torch.isfinite(loss):
+            print(f"  [warn] non-finite loss at step {step}; skipping update.")
+            optimizer.zero_grad(set_to_none=True)
+            continue
 
         scaler.scale(loss).backward()
         if config.grad_clip and config.grad_clip > 0:
@@ -272,13 +331,11 @@ def main():
                 print(f"  [demo skipped] {e}")
 
         if args.save_every and step > 0 and step % args.save_every == 0:
-            ckpt_path = out_dir / "converter.pt"
-            torch.save({"model": converter.state_dict(), "config": vars(config)}, ckpt_path)
+            save_ckpt(step)
 
     # ---- final save ----
-    ckpt_path = out_dir / "converter.pt"
-    torch.save({"model": converter.state_dict(), "config": vars(config)}, ckpt_path)
-    print(f"\nSaved converter checkpoint: {ckpt_path}")
+    save_ckpt(config.steps)
+    print(f"\nSaved converter checkpoint: {out_dir / 'converter.pt'}")
 
     if args.demo_every:
         try:
