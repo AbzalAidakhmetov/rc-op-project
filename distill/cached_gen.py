@@ -89,8 +89,16 @@ class CachedDistillSampler:
         return pool, ref_key
 
     @torch.no_grad()
-    def sample_batch(self, batch_size: int) -> Dict[str, torch.Tensor]:
+    def sample_batch(self, batch_size: int, n_proto: int = 0, n_real: int = 0) -> Dict[str, torch.Tensor]:
+        """Build a distillation batch.
+
+        n_proto>0: also return 'protos' (B, n_proto, D) target prototype frames
+                   sampled from the target pool (for PrototypeConverter).
+        n_real>0:  also return 'real_tgt' (B, n_real, D) random REAL target-speaker
+                   frames (positive examples for an adversarial discriminator).
+        """
         src_list, tgt_list, emb_list, lengths = [], [], [], []
+        proto_list, real_list = [], []
         for _ in range(batch_size):
             src_spk = self.rng.choice(self.speakers)
             cands = [s for s in self.speakers if s != src_spk] or [src_spk]
@@ -108,6 +116,13 @@ class CachedDistillSampler:
             emb_list.append(spk_emb)
             lengths.append(src_feats.shape[0])
 
+            if n_proto > 0:
+                idx = torch.randint(0, pool.shape[0], (n_proto,), device=pool.device)
+                proto_list.append(pool[idx])                                           # (n_proto,1024)
+            if n_real > 0:
+                idx = torch.randint(0, pool.shape[0], (n_real,), device=pool.device)
+                real_list.append(pool[idx])                                            # (n_real,1024)
+
         max_t = max(lengths)
         dim = src_list[0].shape[-1]
         B = batch_size
@@ -117,9 +132,14 @@ class CachedDistillSampler:
             t = sf.shape[0]
             source_feats[i, :t] = sf
             target_feats[i, :t] = tf
-        return {
+        out = {
             "source_feats": source_feats,
             "target_feats": target_feats,
             "spk_emb": torch.stack(emb_list, dim=0),
             "lengths": torch.tensor(lengths, dtype=torch.long, device=self.device),
         }
+        if n_proto > 0:
+            out["protos"] = torch.stack(proto_list, dim=0)      # (B, n_proto, D)
+        if n_real > 0:
+            out["real_tgt"] = torch.stack(real_list, dim=0)     # (B, n_real, D)
+        return out
